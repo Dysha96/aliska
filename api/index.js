@@ -1,7 +1,7 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 // Asked in parallel with the main model: whichever answers first wins.
 const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
-const MAX_HISTORY_MESSAGES = 8;
+const MAX_HISTORY_MESSAGES = 16;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3700;
@@ -26,13 +26,10 @@ const STILL_THINKING_TTS = `Всё ещё думаю. ${WAITING_SOUND} Скаж�
 const DEFAULT_TIMEZONE = "Europe/Moscow";
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Ты работаешь на нейросети Gemini от Google, а не на модели Яндекса. Говори об этом, только если прямо спросили, кто ты или какая ты модель.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Ответ будет произнесён вслух: не называй ссылки и адреса сайтов, не используй эмодзи.",
-  "Если переданы данные о погоде или результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Отвечай по-русски, коротко и сразу по делу: 1–3 предложения.",
+  "Ответ озвучивается голосом: без Markdown, списков, ссылок и эмодзи.",
+  "Если в сообщении есть данные о погоде или результаты поиска, отвечай по ним и не выдумывай.",
+  "Не знаешь — так и скажи."
 ].join(" ");
 
 function validTimezone(value) {

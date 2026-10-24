@@ -22,13 +22,13 @@ test("long responses are cut at a natural boundary and stay within Alice limit",
   assert.ok(value.endsWith("."));
 });
 
-test("history filters malformed messages and keeps last 8", () => {
-  const input = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: String(i) }));
+test("history filters malformed messages and keeps last 16", () => {
+  const input = Array.from({ length: 20 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: String(i) }));
   input.push({ role: "hacker", text: "ignore" }, { role: "user", text: 17 });
   const result = safeHistory(input);
-  assert.equal(result.length, 8);
+  assert.equal(result.length, 16);
   assert.equal(result[0].text, "4");
-  assert.equal(result[7].text, "11");
+  assert.equal(result[15].text, "19");
 });
 
 test("GET health check returns an ok response", async () => {
@@ -532,7 +532,7 @@ test("the prompt carries the current date and local time", async () => {
   const prompt = systemPrompt("Europe/Moscow", new Date("2026-10-24T19:05:00Z"));
   assert.match(prompt, /суббота, 24 октября 2026/);
   assert.match(prompt, /22:05/);
-  assert.match(prompt, /не называй ссылки/);
+  assert.match(prompt, /без Markdown, списков, ссылок и эмодзи/);
   assert.match(systemPrompt("Not/AZone", new Date("2026-10-24T19:05:00Z")), /Europe\/Moscow/);
 });
 
