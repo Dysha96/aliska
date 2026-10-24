@@ -321,12 +321,16 @@ function mockGeminiAndRedis(geminiDelayMs, answer) {
   };
 }
 
-async function say(command, sessionId = "session-1") {
+async function reply(command, sessionId = "session-1") {
   const handler = (await import("../api/index.js")).default;
   let payload;
   const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
   await handler({ method: "POST", body: { session: { session_id: sessionId }, request: { command }, state: { session: {} } } }, res);
-  return payload.response.text;
+  return payload.response;
+}
+
+async function say(command, sessionId = "session-1") {
+  return (await reply(command, sessionId)).text;
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -354,9 +358,14 @@ test("a fast answer is given right away even when the store is configured", asyn
 test("a slow answer is deferred and given on «ну что»", async () => {
   const mock = mockGeminiAndRedis(3800, "Медленный, но полный ответ");
   try {
-    assert.match(await say("Почему небо голубое?"), /ещё думаю/);
+    const waiting = await reply("Почему небо голубое?");
+    assert.match(waiting.text, /ещё думаю/);
+    assert.doesNotMatch(waiting.text, /speaker/);
+    assert.match(waiting.tts, /<speaker audio="alice-music-harp-1\.opus">/);
     await sleep(700);
-    assert.equal(await say("ну что"), "Медленный, но полный ответ");
+    const answer = await reply("ну что");
+    assert.equal(answer.text, "Медленный, но полный ответ");
+    assert.equal(answer.tts, undefined);
     assert.equal(mock.db.size, 0);
   } finally {
     mock.restore();

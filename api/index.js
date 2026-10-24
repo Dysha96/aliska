@@ -15,6 +15,11 @@ const BACKGROUND_BUDGET_MS = 20000;
 const PENDING_TTL_SECONDS = 300;
 const DEFER_TEXT = "Секунду, ещё думаю. Скажите «ну что», и я отвечу.";
 const STILL_THINKING_TEXT = "Всё ещё думаю. Скажите «ну что» ещё раз через пару секунд.";
+// Yandex recommends a sound while the user waits; it also buys Gemini a couple more seconds.
+// Sound library: https://yandex.ru/dev/dialogs/alice/doc/ru/sounds
+const WAITING_SOUND = '<speaker audio="alice-music-harp-1.opus">';
+const DEFER_TTS = `Секунду, ещё думаю. ${WAITING_SOUND} Скажите «ну что», и я отвечу.`;
+const STILL_THINKING_TTS = `Всё ещё думаю. ${WAITING_SOUND} Скажите «ну что» ещё раз.`;
 
 const DEFAULT_TIMEZONE = "Europe/Moscow";
 
@@ -45,11 +50,13 @@ function systemPrompt(timezone = DEFAULT_TIMEZONE, now = new Date()) {
   return `${SYSTEM_PROMPT} Сегодня ${date}, местное время ${time} (${timeZone}).`;
 }
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false, history = [], tts) {
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
+      // tts is what the speaker says; it may hold sounds that the on-screen text must not show.
+      ...(tts ? { tts } : {}),
       end_session: endSession
     },
     session_state: { history }
@@ -571,7 +578,7 @@ async function replyToFollowUp(store, pending, history, inlineLeft) {
     logFallback(error);
     return aliceResponse(errorForUser(error), false, history);
   }
-  return aliceResponse(STILL_THINKING_TEXT, false, history);
+  return aliceResponse(STILL_THINKING_TEXT, false, history, STILL_THINKING_TTS);
 }
 
 async function replyWithStore(store, text, history, inlineLeft, timezone) {
@@ -600,7 +607,7 @@ async function replyWithStore(store, text, history, inlineLeft, timezone) {
       return saveIfCurrent({ status: "error", code: error?.message, httpStatus: error?.status });
     }
   ).catch(error => console.warn("Could not save the background answer:", error?.message)));
-  return aliceResponse(DEFER_TEXT, false, history);
+  return aliceResponse(DEFER_TEXT, false, history, DEFER_TTS);
 }
 
 // Health checks use endpoints that do not spend Gemini or search quota.
