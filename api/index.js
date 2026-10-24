@@ -13,6 +13,8 @@ const PATIENT_SEARCH_TIMEOUT_MS = 5000;
 const INLINE_WAIT_MS = 3300;
 const BACKGROUND_BUDGET_MS = 20000;
 const PENDING_TTL_SECONDS = 300;
+// Yandex's own session storage is unreliable for now, so the conversation lives in the same store.
+const HISTORY_TTL_SECONDS = 1800;
 const DEFER_TEXT = "Секунду, ещё думаю. Скажите «ну что», и я отвечу.";
 const STILL_THINKING_TEXT = "Всё ещё думаю. Скажите «ну что» ещё раз через пару секунд.";
 // Yandex recommends a sound while the user waits; it also buys Gemini a couple more seconds.
@@ -25,7 +27,7 @@ const DEFAULT_TIMEZONE = "Europe/Moscow";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Ты работаешь на нейросети Gemini от Google, а не на модели Яндекса; если спрашивают, кто ты или какая ты модель, так и отвечай.",
+  "Ты работаешь на нейросети Gemini от Google, а не на модели Яндекса. Говори об этом, только если прямо спросили, кто ты или какая ты модель.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Ответ будет произнесён вслух: не называй ссылки и адреса сайтов, не используй эмодзи.",
@@ -527,10 +529,19 @@ async function redis(command) {
   return data.result;
 }
 
-function pendingStore(sessionId) {
+function sessionStore(sessionId) {
   if (!redisConfig() || !sessionId) return null;
   const key = `alice:pending:${sessionId}`;
+  const historyKey = `alice:history:${sessionId}`;
   const store = {
+    // One round trip for both the deferred answer and the conversation so far.
+    async load() {
+      const [pending, history] = (await redis(["MGET", key, historyKey])) || [];
+      return { pending: pending ? JSON.parse(pending) : null, history: history ? JSON.parse(history) : null };
+    },
+    saveHistory(history) {
+      return redis(["SET", historyKey, JSON.stringify(history), "EX", HISTORY_TTL_SECONDS]);
+    },
     async get() {
       const raw = await redis(["GET", key]);
       return raw ? JSON.parse(raw) : null;
@@ -569,8 +580,9 @@ function settleWithin(promise, timeoutMs) {
 async function replyToFollowUp(store, pending, history, inlineLeft) {
   const result = pending.status === "pending" ? await store.waitForResult(inlineLeft()) : pending;
   if (result?.status === "done") {
-    await store.clear();
-    return aliceResponse(result.answer, false, withAnswer(history, result.question, result.answer));
+    const updated = withAnswer(history, result.question, result.answer);
+    await Promise.all([store.clear(), store.saveHistory(updated).catch(() => {})]);
+    return aliceResponse(result.answer, false, updated);
   }
   if (result?.status === "error") {
     await store.clear();
@@ -581,16 +593,22 @@ async function replyToFollowUp(store, pending, history, inlineLeft) {
   return aliceResponse(STILL_THINKING_TEXT, false, history, STILL_THINKING_TTS);
 }
 
-async function replyWithStore(store, text, history, inlineLeft, timezone) {
-  const pending = await store.get().catch(() => null);
+async function replyWithStore(store, text, yandexHistory, inlineLeft, timezone) {
+  const saved = await store.load().catch(() => ({}));
+  const pending = saved.pending || null;
+  const history = saved.history ? safeHistory(saved.history) : yandexHistory;
   if (pending && isFollowUp(text)) return replyToFollowUp(store, pending, history, inlineLeft);
 
   const work = answerQuestion(text, history, BACKGROUND_BUDGET_MS, timezone);
   const quick = await settleWithin(work, inlineLeft());
   if (quick?.error) throw quick.error;
   if (quick) {
-    if (pending) await store.clear().catch(() => {});
-    return aliceResponse(quick.answer, false, withAnswer(history, text, quick.answer));
+    const updated = withAnswer(history, text, quick.answer);
+    await Promise.all([
+      pending ? store.clear().catch(() => {}) : null,
+      store.saveHistory(updated).catch(() => {})
+    ]);
+    return aliceResponse(quick.answer, false, updated);
   }
 
   // Too slow for Alice's timeout: keep working after the response and give the answer on the next phrase.
@@ -703,7 +721,8 @@ function healthConfig() {
     geminiModels: geminiModels(),
     search: searchProvider() || "выключен",
     weather: `Open-Meteo, город по умолчанию: ${String(process.env.WEATHER_CITY || DEFAULT_WEATHER_CITY).trim()}`,
-    deferredAnswers: Boolean(redisConfig())
+    deferredAnswers: Boolean(redisConfig()),
+    memory: Boolean(redisConfig())
   };
 }
 
@@ -752,7 +771,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const store = pendingStore(body?.session?.session_id);
+    const store = sessionStore(body?.session?.session_id);
     if (store) {
       return res.status(200).json(await replyWithStore(store, text, oldHistory, () => INLINE_WAIT_MS - elapsedMs(), timezone));
     }

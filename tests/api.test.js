@@ -286,15 +286,18 @@ test("no search key means no search request", async () => {
 function mockGeminiAndRedis(geminiDelayMs, answer) {
   const original = globalThis.fetch;
   const db = new Map();
+  const geminiBodies = [];
   globalThis.fetch = (url, { body, signal }) => {
     if (url === "https://redis.test") {
-      const [command, key, value] = JSON.parse(body);
+      const [command, key, value, ...rest] = JSON.parse(body);
       let result = "OK";
       if (command === "GET") result = db.get(key) ?? null;
+      if (command === "MGET") result = [key, value, ...rest].map(name => db.get(name) ?? null);
       if (command === "SET") db.set(key, value);
       if (command === "DEL") db.delete(key);
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ result }) });
     }
+    geminiBodies.push(JSON.parse(body));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => resolve({
         ok: true,
@@ -312,6 +315,7 @@ function mockGeminiAndRedis(geminiDelayMs, answer) {
   process.env.KV_REST_API_TOKEN = "redis-token";
   return {
     db,
+    geminiBodies,
     restore() {
       globalThis.fetch = original;
       delete process.env.GEMINI_API_KEY;
@@ -349,7 +353,7 @@ test("a fast answer is given right away even when the store is configured", asyn
   const mock = mockGeminiAndRedis(50, "Быстрый ответ");
   try {
     assert.equal(await say("Почему небо голубое?"), "Быстрый ответ");
-    assert.equal(mock.db.size, 0);
+    assert.equal(mock.db.has("alice:pending:session-1"), false);
   } finally {
     mock.restore();
   }
@@ -366,7 +370,7 @@ test("a slow answer is deferred and given on «ну что»", async () => {
     const answer = await reply("ну что");
     assert.equal(answer.text, "Медленный, но полный ответ");
     assert.equal(answer.tts, undefined);
-    assert.equal(mock.db.size, 0);
+    assert.equal(mock.db.has("alice:pending:session-1"), false);
   } finally {
     mock.restore();
   }
@@ -413,7 +417,8 @@ test("plain health check lists the configuration without calling anything", asyn
       geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
       search: "tavily",
       weather: "Open-Meteo, город по умолчанию: Новосибирск",
-      deferredAnswers: false
+      deferredAnswers: false,
+      memory: false
     });
     assert.equal(report.checks, undefined);
   } finally {
@@ -644,6 +649,39 @@ test("search snippets become one clean line each", async () => {
       await searchWeb("курс доллара", 1000),
       "Краткий ответ поисковика: Курс доллара 95\n1. Курсы ЦБ: Доллар 95 рублей\n2. Второй: текст"
     );
+  } finally {
+    mock.restore();
+  }
+});
+
+test("the conversation is remembered within a session", async () => {
+  const mock = mockGeminiAndRedis(10, "Лев Толстой.");
+  try {
+    await say("Кто написал «Войну и мир»?", "chat-1");
+    await say("А сколько ему было лет?", "chat-1");
+    const second = mock.geminiBodies.at(-2).contents;
+    assert.deepEqual(second.map(item => item.role), ["user", "model", "user"]);
+    assert.equal(second[0].parts[0].text, "Кто написал «Войну и мир»?");
+    assert.equal(second[1].parts[0].text, "Лев Толстой.");
+    assert.equal(JSON.parse(mock.db.get("alice:history:chat-1")).length, 4);
+
+    await say("Привет", "another-chat");
+    assert.equal(mock.geminiBodies.at(-1).contents.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a deferred answer joins the conversation history", async () => {
+  const mock = mockGeminiAndRedis(3800, "Подробный ответ");
+  try {
+    await say("Расскажи про чёрные дыры", "chat-2");
+    await sleep(700);
+    await say("ну что", "chat-2");
+    assert.deepEqual(JSON.parse(mock.db.get("alice:history:chat-2")), [
+      { role: "user", text: "Расскажи про чёрные дыры" },
+      { role: "model", text: "Подробный ответ" }
+    ]);
   } finally {
     mock.restore();
   }
