@@ -282,3 +282,103 @@ test("no search key means no search request", async () => {
     mock.restore();
   }
 });
+
+function mockGeminiAndRedis(geminiDelayMs, answer) {
+  const original = globalThis.fetch;
+  const db = new Map();
+  globalThis.fetch = (url, { body, signal }) => {
+    if (url === "https://redis.test") {
+      const [command, key, value] = JSON.parse(body);
+      let result = "OK";
+      if (command === "GET") result = db.get(key) ?? null;
+      if (command === "SET") db.set(key, value);
+      if (command === "DEL") db.delete(key);
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ result }) });
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ candidates: [{ content: { parts: [{ text: answer }] }, finishReason: "STOP" }] })
+      }), geminiDelayMs);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      });
+    });
+  };
+  process.env.GEMINI_API_KEY = "test-key";
+  process.env.KV_REST_API_URL = "https://redis.test";
+  process.env.KV_REST_API_TOKEN = "redis-token";
+  return {
+    db,
+    restore() {
+      globalThis.fetch = original;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.KV_REST_API_URL;
+      delete process.env.KV_REST_API_TOKEN;
+    }
+  };
+}
+
+async function say(command, sessionId = "session-1") {
+  const handler = (await import("../api/index.js")).default;
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  await handler({ method: "POST", body: { session: { session_id: sessionId }, request: { command }, state: { session: {} } } }, res);
+  return payload.response.text;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+test("follow-up phrases are recognised", async () => {
+  const { isFollowUp } = await import("../api/index.js");
+  for (const phrase of ["ну что", "Ну что?", "что там", "ну", "готово", "дальше", "ну что там"]) {
+    assert.equal(isFollowUp(phrase), true, phrase);
+  }
+  for (const phrase of ["что такое любовь", "почему небо голубое", "какая погода"]) {
+    assert.equal(isFollowUp(phrase), false, phrase);
+  }
+});
+
+test("a fast answer is given right away even when the store is configured", async () => {
+  const mock = mockGeminiAndRedis(50, "Быстрый ответ");
+  try {
+    assert.equal(await say("Почему небо голубое?"), "Быстрый ответ");
+    assert.equal(mock.db.size, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a slow answer is deferred and given on «ну что»", async () => {
+  const mock = mockGeminiAndRedis(3800, "Медленный, но полный ответ");
+  try {
+    assert.match(await say("Почему небо голубое?"), /ещё думаю/);
+    await sleep(700);
+    assert.equal(await say("ну что"), "Медленный, но полный ответ");
+    assert.equal(mock.db.size, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("«ну что» waits for an answer that is still being prepared", async () => {
+  const mock = mockGeminiAndRedis(5000, "Ответ после ожидания");
+  try {
+    assert.match(await say("Расскажи про чёрные дыры"), /ещё думаю/);
+    assert.equal(await say("ну что?"), "Ответ после ожидания");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("without a store a slow answer still ends with the timeout message", async () => {
+  const mock = mockGeminiAndRedis(5000, "поздно");
+  delete process.env.KV_REST_API_URL;
+  try {
+    assert.match(await say("Почему небо голубое?"), /Не успела/);
+  } finally {
+    mock.restore();
+  }
+});

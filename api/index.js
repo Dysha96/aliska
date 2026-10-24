@@ -4,11 +4,16 @@ const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const TOTAL_RESPONSE_BUDGET_MS = 3700;
 const SERPER_TIMEOUT_MS = 600;
 // Tavily is usually slower than Serper, so it gets a bit more of the 4.5 s Alice budget.
 const TAVILY_TIMEOUT_MS = 1200;
-const GEMINI_TIMEOUT_MS = 3400;
+// With a store configured, a slow answer is finished in the background and given on the next phrase.
+const INLINE_WAIT_MS = 3300;
+const BACKGROUND_BUDGET_MS = 20000;
+const PENDING_TTL_SECONDS = 300;
+const DEFER_TEXT = "Секунду, ещё думаю. Скажите «ну что», и я отвечу.";
+const STILL_THINKING_TEXT = "Всё ещё думаю. Скажите «ну что» ещё раз через пару секунд.";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -244,7 +249,7 @@ async function askGeminiModel(model, key, text, history, searchContext, timeoutM
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs),
+    timeoutMs,
     signal
   );
 
@@ -290,6 +295,8 @@ function errorForUser(error) {
     case "TIME_BUDGET_EXHAUSTED":
     case "TIMEOUT":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+    case "STORE_FAILED":
+      return "Не успела подготовить ответ, а отложить его не получилось. Проверьте базу Upstash в настройках Vercel.";
     case "GEMINI_EMPTY_RESPONSE":
       return "Нейросеть вернула пустой ответ. Попробуйте спросить иначе.";
     default:
@@ -297,11 +304,150 @@ function errorForUser(error) {
   }
 }
 
+async function answerQuestion(text, history, budgetMs) {
+  const startedAt = Date.now();
+  const remainingMs = () => budgetMs - (Date.now() - startedAt);
+
+  let searchContext = "";
+  if (isSearchIntent(text) && searchProvider()) {
+    // Search gets only what is left after reserving time for Gemini; each provider also has its own cap.
+    searchContext = await searchWeb(text, Math.max(0, remainingMs() - 2600));
+  }
+  return askGemini(text, history, searchContext, Math.max(0, remainingMs()));
+}
+
+function withAnswer(history, question, answer) {
+  return [
+    ...history,
+    { role: "user", text: question.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+    { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+  ].slice(-MAX_HISTORY_MESSAGES);
+}
+
+function logFallback(error) {
+  // Raw fetch error messages are not logged: some of them echo the API key.
+  const code = /^[A-Z_]+$/.test(error?.message || "")
+    ? error.message
+    : `NETWORK_ERROR ${error?.cause?.code || error?.name || ""}`;
+  console.warn("Alice webhook returned a fallback response:", code, error?.status || "");
+}
+
+function isFollowUp(text) {
+  return /^(?:(?:ну|и|а|так)\s*)?(?:что там|что|как|чё|че|готово|готов|дальше|давай|какой ответ|ответ|говори|скажи|продолжай)?[\s?!.]*$/i.test(text.trim());
+}
+
+// Upstash Redis over its REST API. Vercel's Upstash integration sets KV_REST_API_*,
+// a database created on upstash.com directly gives UPSTASH_REDIS_REST_*.
+function redisConfig() {
+  const url = String(process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "");
+  const token = cleanKey(process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN);
+  return url && token ? { url, token } : null;
+}
+
+async function redis(command) {
+  const { url, token } = redisConfig();
+  const { response, data } = await fetchJson(
+    url,
+    {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(command)
+    },
+    800
+  );
+  if (!response.ok || data?.error) throw Object.assign(new Error("STORE_FAILED"), { status: response.status });
+  return data.result;
+}
+
+function pendingStore(sessionId) {
+  if (!redisConfig() || !sessionId) return null;
+  const key = `alice:pending:${sessionId}`;
+  const store = {
+    async get() {
+      const raw = await redis(["GET", key]);
+      return raw ? JSON.parse(raw) : null;
+    },
+    set(value) {
+      return redis(["SET", key, JSON.stringify(value), "EX", PENDING_TTL_SECONDS]);
+    },
+    clear() {
+      return redis(["DEL", key]);
+    },
+    async waitForResult(timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const value = await store.get();
+        if (value?.status !== "pending" || Date.now() + 300 > deadline) return value;
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+  };
+  return store;
+}
+
+// Same as waitUntil from @vercel/functions, without pulling in its dependency tree:
+// keeps the function alive after the response until the promise settles.
+function waitUntil(promise) {
+  globalThis[Symbol.for("@vercel/request-context")]?.get?.()?.waitUntil?.(promise);
+}
+
+function settleWithin(promise, timeoutMs) {
+  return Promise.race([
+    promise.then(answer => ({ answer }), error => ({ error })),
+    new Promise(resolve => setTimeout(() => resolve(null), Math.max(0, timeoutMs)))
+  ]);
+}
+
+async function replyToFollowUp(store, pending, history, inlineLeft) {
+  const result = pending.status === "pending" ? await store.waitForResult(inlineLeft()) : pending;
+  if (result?.status === "done") {
+    await store.clear();
+    return aliceResponse(result.answer, false, withAnswer(history, result.question, result.answer));
+  }
+  if (result?.status === "error") {
+    await store.clear();
+    const error = Object.assign(new Error(result.code), { status: result.httpStatus });
+    logFallback(error);
+    return aliceResponse(errorForUser(error), false, history);
+  }
+  return aliceResponse(STILL_THINKING_TEXT, false, history);
+}
+
+async function replyWithStore(store, text, history, inlineLeft) {
+  const pending = await store.get().catch(() => null);
+  if (pending && isFollowUp(text)) return replyToFollowUp(store, pending, history, inlineLeft);
+
+  const work = answerQuestion(text, history, BACKGROUND_BUDGET_MS);
+  const quick = await settleWithin(work, inlineLeft());
+  if (quick?.error) throw quick.error;
+  if (quick) {
+    if (pending) await store.clear().catch(() => {});
+    return aliceResponse(quick.answer, false, withAnswer(history, text, quick.answer));
+  }
+
+  // Too slow for Alice's timeout: keep working after the response and give the answer on the next phrase.
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await store.set({ status: "pending", id, question: text });
+  // A newer question may have replaced this one meanwhile; its slot must not be overwritten.
+  const saveIfCurrent = async value => {
+    if ((await store.get())?.id === id) await store.set({ ...value, id, question: text });
+  };
+  waitUntil(work.then(
+    answer => saveIfCurrent({ status: "done", answer }),
+    error => {
+      logFallback(error);
+      return saveIfCurrent({ status: "error", code: error?.message, httpStatus: error?.status });
+    }
+  ).catch(error => console.warn("Could not save the background answer:", error?.message)));
+  return aliceResponse(DEFER_TEXT, false, history);
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
+      deferredAnswers: Boolean(redisConfig()),
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -312,7 +458,7 @@ export default async function handler(req, res) {
   }
 
   const startedAt = Date.now();
-  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+  const elapsedMs = () => Date.now() - startedAt;
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
@@ -326,34 +472,17 @@ export default async function handler(req, res) {
   }
 
   try {
-    let searchContext = "";
-    if (isSearchIntent(text) && searchProvider()) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.max(0, remainingMs() - 2600));
+    const store = pendingStore(body?.session?.session_id);
+    if (store) {
+      return res.status(200).json(await replyWithStore(store, text, oldHistory, () => INLINE_WAIT_MS - elapsedMs()));
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
-    );
-
-    const history = [
-      ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
-
-    return res.status(200).json(aliceResponse(answer, false, history));
+    const answer = await answerQuestion(text, oldHistory, TOTAL_RESPONSE_BUDGET_MS - elapsedMs());
+    return res.status(200).json(aliceResponse(answer, false, withAnswer(oldHistory, text, answer)));
   } catch (error) {
-    // Raw fetch error messages are not logged: some of them echo the API key.
-    const code = /^[A-Z_]+$/.test(error?.message || "")
-      ? error.message
-      : `NETWORK_ERROR ${error?.cause?.code || error?.name || ""}`;
-    console.warn("Alice webhook returned a fallback response:", code, error?.status || "");
+    logFallback(error);
     return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }
 
-export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isSearchIntent, safeHistory, searchWeb };
+export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isFollowUp, isSearchIntent, safeHistory, searchWeb };
