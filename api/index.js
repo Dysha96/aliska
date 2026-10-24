@@ -110,14 +110,17 @@ function searchProvider() {
   return "";
 }
 
+// Page snippets often carry line breaks and Markdown (#, *, |); one clean line per result saves tokens.
+function oneLine(value, maxChars) {
+  return String(value || "").replace(/[#*|_`>]+/g, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
 function formatSearchItems(items, shortAnswer) {
-  const lines = items.slice(0, 3).map((item, i) => {
-    const title = String(item.title || "").slice(0, 180);
-    const snippet = String(item.snippet || "").slice(0, 350);
+  const lines = items.slice(0, 3).map((item, i) =>
     // Links are left out: they cost tokens and the model might read them aloud.
-    return `${i + 1}. ${title}: ${snippet}`.trim();
-  });
-  if (shortAnswer) lines.unshift(`Краткий ответ поисковика: ${String(shortAnswer).slice(0, 350)}`);
+    `${i + 1}. ${oneLine(item.title, 180)}: ${oneLine(item.snippet, 350)}`
+  );
+  if (shortAnswer) lines.unshift(`Краткий ответ поисковика: ${oneLine(shortAnswer, 350)}`);
   return lines.join("\n");
 }
 
@@ -173,7 +176,9 @@ async function searchWeb(query, timeoutMs) {
   const startedAt = Date.now();
   try {
     const context = provider === "tavily" ? await searchTavily(query, timeoutMs) : await searchSerper(query, timeoutMs);
-    console.log(`Search via ${provider}: ${context ? context.split("\n").length : 0} results in ${Date.now() - startedAt} ms`);
+    const lines = context ? context.split("\n") : [];
+    const hasShortAnswer = lines[0]?.startsWith("Краткий ответ") || false;
+    console.log(`Search via ${provider}: ${lines.length - Number(hasShortAnswer)} results, short answer: ${hasShortAnswer ? "yes" : "no"}, in ${Date.now() - startedAt} ms`);
     return context;
   } catch (error) {
     console.warn(`Search via ${provider} failed; continuing without search:`, error?.status || error?.message);

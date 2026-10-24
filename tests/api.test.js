@@ -619,3 +619,23 @@ test("a weather question goes to Open-Meteo instead of the web search", async ()
     mock.restore();
   }
 });
+
+test("search snippets become one clean line each", async () => {
+  const { searchWeb } = await import("../api/index.js");
+  const mock = mockSearch({
+    status: 200,
+    body: {
+      answer: "Курс\nдоллара 95",
+      results: [{ title: "## Курсы | ЦБ", content: "**Доллар**\n\n| 95 | рублей |\n" }, { title: "Второй", content: "текст" }]
+    }
+  });
+  process.env.TAVILY_API_KEY = "tvly-test";
+  try {
+    assert.equal(
+      await searchWeb("курс доллара", 1000),
+      "Краткий ответ поисковика: Курс доллара 95\n1. Курсы ЦБ: Доллар 95 рублей\n2. Второй: текст"
+    );
+  } finally {
+    mock.restore();
+  }
+});
