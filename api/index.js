@@ -76,7 +76,7 @@ async function fetchJson(url, options, timeoutMs, outerSignal) {
 }
 
 async function searchWeb(query, timeoutMs) {
-  const key = process.env.SERPER_API_KEY;
+  const key = cleanKey(process.env.SERPER_API_KEY);
   if (!key || timeoutMs < 150) return "";
 
   try {
@@ -124,6 +124,7 @@ function geminiModels() {
 
 const ERROR_PRIORITY = [
   "MISSING_GEMINI_KEY",
+  "GEMINI_KEY_MALFORMED",
   "INVALID_MODEL_NAME",
   "GEMINI_KEY_REJECTED",
   "GEMINI_MODEL_NOT_FOUND",
@@ -142,8 +143,10 @@ function mostUsefulError(errors) {
 }
 
 function cleanKey(value) {
-  // Keys pasted into Vercel often come with spaces or quotes around them.
-  return String(value || "").trim().replace(/^["'«]+|["'»]+$/g, "").trim();
+  // Keys pasted into Vercel often come with quotes, spaces, line breaks or invisible characters.
+  return String(value || "")
+    .replace(/[\s\u200B-\u200D\u2060\uFEFF]+/g, "")
+    .replace(/^["'«“]+|["'»”]+$/g, "");
 }
 
 function geminiHttpError(status, data) {
@@ -158,6 +161,8 @@ function geminiHttpError(status, data) {
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = cleanKey(process.env.GEMINI_API_KEY);
   if (!key) throw new Error("MISSING_GEMINI_KEY");
+  // Non-Latin characters (e.g. a Cyrillic "А") make fetch fail before the request is even sent.
+  if (!/^[A-Za-z0-9._-]+$/.test(key)) throw new Error("GEMINI_KEY_MALFORMED");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   // Gemini latency varies a lot under load, so the models race and the slower request is cancelled.
@@ -233,6 +238,8 @@ function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+    case "GEMINI_KEY_MALFORMED":
+      return "В ключе GEMINI_API_KEY есть лишние символы, например русские буквы. Скопируйте ключ из Google AI Studio заново и вставьте его в Vercel.";
     case "GEMINI_KEY_REJECTED":
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
@@ -250,7 +257,7 @@ function errorForUser(error) {
     case "GEMINI_EMPTY_RESPONSE":
       return "Нейросеть вернула пустой ответ. Попробуйте спросить иначе.";
     default:
-      return `Не получилось получить ответ от нейросети (${error?.status ? "ошибка " + error.status : "нет связи"}). Попробуйте ещё раз чуть позже.`;
+      return `Не получилось получить ответ от нейросети (${error?.status ? "ошибка " + error.status : "сетевая ошибка"}). Попробуйте ещё раз чуть позже.`;
   }
 }
 
@@ -304,7 +311,11 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    console.warn("Alice webhook returned a fallback response:", error?.message || "unknown error", error?.status || "");
+    // Raw fetch error messages are not logged: some of them echo the API key.
+    const code = /^[A-Z_]+$/.test(error?.message || "")
+      ? error.message
+      : `NETWORK_ERROR ${error?.cause?.code || error?.name || ""}`;
+    console.warn("Alice webhook returned a fallback response:", code, error?.status || "");
     return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }

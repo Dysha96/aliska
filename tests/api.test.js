@@ -186,3 +186,24 @@ test("unexpected Gemini errors name the HTTP status", async () => {
     restore();
   }
 });
+
+test("invisible characters inside the key are removed", async () => {
+  const { cleanKey } = await import("../api/index.js");
+  assert.equal(cleanKey("AQ.Ab8\u200bRN6\nI4b\uFEFF"), "AQ.Ab8RN6I4b");
+  assert.equal(cleanKey("«AQ.abc»"), "AQ.abc");
+});
+
+test("a key with Cyrillic letters gets a clear message instead of a network error", async () => {
+  const { askGemini, errorForUser } = await import("../api/index.js");
+  const restore = mockGemini({});
+  process.env.GEMINI_API_KEY = "\u0410Q.Ab8RN6I4b";
+  try {
+    await assert.rejects(askGemini("вопрос", [], "", 1000), error => {
+      assert.equal(error.message, "GEMINI_KEY_MALFORMED");
+      assert.match(errorForUser(error), /русские буквы/);
+      return true;
+    });
+  } finally {
+    restore();
+  }
+});
