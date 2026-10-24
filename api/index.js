@@ -5,9 +5,10 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3700;
-const SERPER_TIMEOUT_MS = 600;
-// Tavily is usually slower than Serper, so it gets a bit more of the 4.5 s Alice budget.
-const TAVILY_TIMEOUT_MS = 1200;
+// Search time when the answer must fit into Alice's 4.5 s: Tavily is usually slower than Serper.
+const SEARCH_TIMEOUT_MS = { serper: 600, tavily: 1200 };
+// When a slow answer can be deferred to "ну что", search may take longer and return fuller results.
+const PATIENT_SEARCH_TIMEOUT_MS = 5000;
 // With a store configured, a slow answer is finished in the background and given on the next phrase.
 const INLINE_WAIT_MS = 3300;
 const BACKGROUND_BUDGET_MS = 20000;
@@ -110,7 +111,7 @@ async function searchSerper(query, timeoutMs) {
       },
       body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
     },
-    Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
   if (!response.ok) throw Object.assign(new Error("SEARCH_FAILED"), { status: response.status });
 
@@ -131,9 +132,10 @@ async function searchTavily(query, timeoutMs) {
         "Authorization": `Bearer ${cleanKey(process.env.TAVILY_API_KEY)}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ query, search_depth: "basic", max_results: 3, include_answer: false })
+      // Tavily's short answer often holds the actual numbers (weather, rates), but takes extra time.
+      body: JSON.stringify({ query, search_depth: "basic", max_results: 3, include_answer: timeoutMs >= 3000 })
     },
-    Math.min(TAVILY_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
   if (!response.ok) throw Object.assign(new Error("SEARCH_FAILED"), { status: response.status });
 
@@ -149,8 +151,11 @@ async function searchWeb(query, timeoutMs) {
   const provider = searchProvider();
   if (!provider || timeoutMs < 150) return "";
 
+  const startedAt = Date.now();
   try {
-    return provider === "tavily" ? await searchTavily(query, timeoutMs) : await searchSerper(query, timeoutMs);
+    const context = provider === "tavily" ? await searchTavily(query, timeoutMs) : await searchSerper(query, timeoutMs);
+    console.log(`Search via ${provider}: ${context ? context.split("\n").length : 0} results in ${Date.now() - startedAt} ms`);
+    return context;
   } catch (error) {
     console.warn(`Search via ${provider} failed; continuing without search:`, error?.status || error?.message);
     return "";
@@ -309,9 +314,12 @@ async function answerQuestion(text, history, budgetMs) {
   const remainingMs = () => budgetMs - (Date.now() - startedAt);
 
   let searchContext = "";
-  if (isSearchIntent(text) && searchProvider()) {
-    // Search gets only what is left after reserving time for Gemini; each provider also has its own cap.
-    searchContext = await searchWeb(text, Math.max(0, remainingMs() - 2600));
+  const provider = searchProvider();
+  if (isSearchIntent(text) && provider) {
+    // Search gets only what is left after reserving time for Gemini, and no more than its cap.
+    const patient = budgetMs > TOTAL_RESPONSE_BUDGET_MS;
+    const cap = patient ? PATIENT_SEARCH_TIMEOUT_MS : SEARCH_TIMEOUT_MS[provider];
+    searchContext = await searchWeb(text, Math.min(cap, Math.max(0, remainingMs() - 2600)));
   }
   return askGemini(text, history, searchContext, Math.max(0, remainingMs()));
 }

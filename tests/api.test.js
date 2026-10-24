@@ -459,3 +459,55 @@ test("?check=1 reports a rejected Gemini key as not ok", async () => {
     delete process.env.GEMINI_API_KEY;
   }
 });
+
+function mockSlowTavily(tavilyDelayMs) {
+  const original = globalThis.fetch;
+  const tavilyBodies = [];
+  globalThis.fetch = (url, { body, signal }) => {
+    const reply = (payload, delayMs = 0) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ ok: true, status: 200, json: async () => payload }), delayMs);
+      signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      });
+    });
+    if (url === "https://redis.test") return reply({ result: null });
+    if (url === "https://api.tavily.com/search") {
+      tavilyBodies.push(JSON.parse(body));
+      return reply({ answer: "В Москве +5, облачно", results: [] }, tavilyDelayMs);
+    }
+    const usedSearch = body.includes("В Москве +5");
+    return reply({ candidates: [{ content: { parts: [{ text: usedSearch ? "С поиском" : "Без поиска" }] } }] }, 50);
+  };
+  process.env.GEMINI_API_KEY = "test-key";
+  process.env.TAVILY_API_KEY = "tvly-test";
+  return {
+    tavilyBodies,
+    restore() {
+      globalThis.fetch = original;
+      for (const name of ["GEMINI_API_KEY", "TAVILY_API_KEY", "KV_REST_API_URL", "KV_REST_API_TOKEN"]) delete process.env[name];
+    }
+  };
+}
+
+test("with the store configured, a slow search is waited for and asked for a short answer", async () => {
+  const mock = mockSlowTavily(2500);
+  process.env.KV_REST_API_URL = "https://redis.test";
+  process.env.KV_REST_API_TOKEN = "redis-token";
+  try {
+    assert.equal(await say("Какая погода сегодня в Москве?"), "С поиском");
+    assert.equal(mock.tavilyBodies[0].include_answer, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("without the store, search keeps its short limit so Alice is not kept waiting", async () => {
+  const mock = mockSlowTavily(2500);
+  try {
+    assert.equal(await say("Какая погода сегодня в Москве?"), "Без поиска");
+    assert.equal(mock.tavilyBodies[0].include_answer, false);
+  } finally {
+    mock.restore();
+  }
+});
