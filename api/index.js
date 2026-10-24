@@ -1,10 +1,12 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+// Asked in parallel with the main model: whichever answers first wins.
+const DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 3400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -57,13 +59,17 @@ function safeHistory(history) {
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(url, options, timeoutMs, outerSignal) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const signal = outerSignal ? AbortSignal.any([controller.signal, outerSignal]) : controller.signal;
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, signal });
     const data = await response.json().catch(() => ({}));
     return { response, data };
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("TIMEOUT");
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -110,12 +116,49 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function geminiModels() {
+  const main = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  const fallback = String(process.env.GEMINI_FALLBACK_MODEL ?? DEFAULT_FALLBACK_MODEL).trim();
+  return [...new Set([main, fallback].filter(Boolean))];
+}
+
+const ERROR_PRIORITY = [
+  "MISSING_GEMINI_KEY",
+  "INVALID_MODEL_NAME",
+  "GEMINI_KEY_REJECTED",
+  "GEMINI_QUOTA",
+  "GEMINI_OVERLOADED",
+  "TIMEOUT",
+  "GEMINI_BLOCKED"
+];
+
+function mostUsefulError(errors) {
+  for (const name of ERROR_PRIORITY) {
+    const found = errors.find(error => error?.message === name);
+    if (found) return found;
+  }
+  return errors[0];
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  // Gemini latency varies a lot under load, so the models race and the slower request is cancelled.
+  const race = new AbortController();
+  try {
+    return await Promise.any(geminiModels().map(model =>
+      askGeminiModel(model, key, text, history, searchContext, timeoutMs, race.signal)
+    ));
+  } catch (error) {
+    throw mostUsefulError(error?.errors || [error]);
+  } finally {
+    race.abort();
+  }
+}
+
+async function askGeminiModel(model, key, text, history, searchContext, timeoutMs, signal) {
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
@@ -145,14 +188,16 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(GEMINI_TIMEOUT_MS, timeoutMs),
+    signal
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error(`Gemini ${model} request failed with HTTP`, status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
+    if (status === 500 || status === 503) throw new Error("GEMINI_OVERLOADED");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
@@ -167,7 +212,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
   if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+    console.warn(`Gemini ${model} reached the output token limit.`);
   }
   return answer;
 }
@@ -182,8 +227,12 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "GEMINI_OVERLOADED":
+      return "Нейросеть сейчас перегружена. Попробуйте ещё раз через минуту.";
+    case "INVALID_MODEL_NAME":
+      return "В настройках Vercel указано неправильное имя модели Gemini.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
+    case "TIMEOUT":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -229,7 +278,7 @@ export default async function handler(req, res) {
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
     );
 
     const history = [
@@ -240,10 +289,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    console.warn("Alice webhook returned a fallback response:", error?.message || "unknown error");
+    return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, askGemini, errorForUser, fitAliceText, isSearchIntent, safeHistory };
