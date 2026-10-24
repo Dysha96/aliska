@@ -361,7 +361,7 @@ test("a slow answer is deferred and given on «ну что»", async () => {
     const waiting = await reply("Почему небо голубое?");
     assert.match(waiting.text, /ещё думаю/);
     assert.doesNotMatch(waiting.text, /speaker/);
-    assert.match(waiting.tts, /<speaker audio="alice-music-harp-1\.opus">/);
+    assert.match(waiting.tts, /<speaker audio="alice-music-drums-3\.opus">/);
     await sleep(700);
     const answer = await reply("ну что");
     assert.equal(answer.text, "Медленный, но полный ответ");
