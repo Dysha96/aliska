@@ -382,3 +382,80 @@ test("without a store a slow answer still ends with the timeout message", async 
     mock.restore();
   }
 });
+
+async function health(url) {
+  const handler = (await import("../api/index.js")).default;
+  let payload;
+  const res = { status() { return this; }, json(value) { payload = value; return value; }, setHeader() {} };
+  await handler({ method: "GET", url }, res);
+  return payload;
+}
+
+test("plain health check lists the configuration without calling anything", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("must not be called"); };
+  process.env.GEMINI_API_KEY = "test-key";
+  process.env.TAVILY_API_KEY = "tvly-test";
+  try {
+    const report = await health("/api");
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.config, {
+      gemini: "ключ задан",
+      geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+      search: "tavily",
+      deferredAnswers: false
+    });
+    assert.equal(report.checks, undefined);
+  } finally {
+    globalThis.fetch = original;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.TAVILY_API_KEY;
+  }
+});
+
+test("?check=1 verifies Gemini models, search usage and the store", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const reply = (status, body) => ({ ok: status === 200, status, json: async () => body });
+    if (url.endsWith("/models/gemini-3.5-flash-lite")) return reply(200, { name: "models/gemini-3.5-flash-lite" });
+    if (url.endsWith("/models/gemini-3.1-flash-lite")) return reply(404, { error: { code: 404 } });
+    if (url === "https://api.tavily.com/usage") {
+      assert.equal(options.headers.Authorization, "Bearer tvly-test");
+      return reply(200, { key: { usage: 12, limit: 1000 } });
+    }
+    if (url === "https://redis.test") return reply(200, { result: "PONG" });
+    throw new Error(`unexpected ${url}`);
+  };
+  process.env.GEMINI_API_KEY = "test-key";
+  process.env.TAVILY_API_KEY = "tvly-test";
+  process.env.KV_REST_API_URL = "https://redis.test";
+  process.env.KV_REST_API_TOKEN = "redis-token";
+  try {
+    const report = await health("/api?check=1");
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.checks, {
+      gemini: { ok: true, models: { "gemini-3.5-flash-lite": "ok", "gemini-3.1-flash-lite": "модель не найдена" } },
+      search: { provider: "tavily", ok: true, status: "ok", used: 12, limit: 1000 },
+      deferredAnswers: { ok: true, status: "ok" }
+    });
+  } finally {
+    globalThis.fetch = original;
+    for (const name of ["GEMINI_API_KEY", "TAVILY_API_KEY", "KV_REST_API_URL", "KV_REST_API_TOKEN"]) delete process.env[name];
+  }
+});
+
+test("?check=1 reports a rejected Gemini key as not ok", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: { details: [{ reason: "API_KEY_INVALID" }] } }) });
+  process.env.GEMINI_API_KEY = "AQ.wrong";
+  try {
+    const report = await health("/api?check=1");
+    assert.equal(report.ok, false);
+    assert.equal(report.checks.gemini.models["gemini-3.5-flash-lite"], "ключ не принят");
+    assert.equal(report.checks.search.ok, false);
+    assert.equal(report.checks.deferredAnswers.ok, false);
+  } finally {
+    globalThis.fetch = original;
+    delete process.env.GEMINI_API_KEY;
+  }
+});

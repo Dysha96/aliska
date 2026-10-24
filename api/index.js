@@ -442,14 +442,124 @@ async function replyWithStore(store, text, history, inlineLeft) {
   return aliceResponse(DEFER_TEXT, false, history);
 }
 
+// Health checks use endpoints that do not spend Gemini or search quota.
+const HEALTH_TIMEOUT_MS = 3000;
+const HEALTH_TEXT = {
+  GEMINI_KEY_REJECTED: "ключ не принят",
+  GEMINI_MODEL_NOT_FOUND: "модель не найдена",
+  GEMINI_QUOTA: "лимит исчерпан",
+  GEMINI_OVERLOADED: "сервис перегружен"
+};
+
+async function probe(url, headers, okResult, body) {
+  try {
+    const { response, data } = await fetchJson(
+      url,
+      body ? { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body) } : { headers },
+      HEALTH_TIMEOUT_MS
+    );
+    if (response.ok && !data?.error) return { ok: true, status: "ok", ...okResult(data) };
+    const status = Number(response.status);
+    if (status === 401 || status === 403) return { ok: false, status: "ключ не принят" };
+    if (status === 429 || status === 432 || status === 433) return { ok: false, status: "лимит исчерпан" };
+    return { ok: false, status: `ошибка HTTP ${status}`, httpStatus: status, data };
+  } catch (error) {
+    return { ok: false, status: error?.message === "TIMEOUT" ? "нет ответа" : "сетевая ошибка" };
+  }
+}
+
+async function checkGemini() {
+  const key = cleanKey(process.env.GEMINI_API_KEY);
+  if (!key) return { ok: false, status: "ключ GEMINI_API_KEY не задан" };
+  if (!/^[A-Za-z0-9._-]+$/.test(key)) return { ok: false, status: "в ключе лишние символы, например русские буквы" };
+
+  const models = {};
+  await Promise.all(geminiModels().map(async model => {
+    if (!/^[A-Za-z0-9._-]+$/.test(model)) {
+      models[model] = "неправильное имя модели";
+      return;
+    }
+    const result = await probe(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}`,
+      { "x-goog-api-key": key },
+      () => ({})
+    );
+    models[model] = result.httpStatus
+      ? HEALTH_TEXT[geminiHttpError(result.httpStatus, result.data).message] || result.status
+      : result.status;
+  }));
+  // The models race, so one working model is enough to answer.
+  return { ok: Object.values(models).includes("ok"), models };
+}
+
+async function checkSearch() {
+  const provider = searchProvider();
+  if (!provider) return { ok: false, status: "выключен: не задан TAVILY_API_KEY или SERPER_API_KEY" };
+
+  if (provider === "tavily") {
+    const result = await probe(
+      "https://api.tavily.com/usage",
+      { "Authorization": `Bearer ${cleanKey(process.env.TAVILY_API_KEY)}` },
+      data => ({
+        used: data?.key?.usage ?? data?.account?.plan_usage,
+        limit: data?.key?.limit ?? data?.account?.plan_limit
+      })
+    );
+    return { provider, ...stripProbeDetails(result) };
+  }
+
+  const result = await probe(
+    "https://google.serper.dev/account",
+    { "X-API-KEY": cleanKey(process.env.SERPER_API_KEY) },
+    data => (data?.balance !== undefined ? { balance: data.balance } : {})
+  );
+  // Serper's account endpoint is not documented, so anything but a clear answer is "unknown", not a failure.
+  if (!result.ok && result.httpStatus) return { provider, ok: null, status: "ключ задан, проверить не удалось" };
+  return { provider, ...stripProbeDetails(result) };
+}
+
+async function checkStore() {
+  const config = redisConfig();
+  if (!config) return { ok: false, status: "не подключена: медленные ответы не откладываются" };
+  const result = await probe(config.url, { "Authorization": `Bearer ${config.token}` }, () => ({}), ["PING"]);
+  return stripProbeDetails(result);
+}
+
+function stripProbeDetails({ httpStatus, data, ...rest }) {
+  return rest;
+}
+
+function healthConfig() {
+  return {
+    gemini: cleanKey(process.env.GEMINI_API_KEY) ? "ключ задан" : "ключ не задан",
+    geminiModels: geminiModels(),
+    search: searchProvider() || "выключен",
+    deferredAnswers: Boolean(redisConfig())
+  };
+}
+
+async function healthReport(deep) {
+  const report = {
+    ok: true,
+    service: "alice-gemini-serper",
+    message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
+    config: healthConfig()
+  };
+  if (!deep) return { ...report, hint: "Откройте /api?check=1, чтобы проверить ключи и подключения." };
+
+  const [gemini, search, deferredAnswers] = await Promise.all([checkGemini(), checkSearch(), checkStore()]);
+  // Search and the store are optional: only Gemini decides whether the skill can answer at all.
+  return { ...report, ok: gemini.ok, checks: { gemini, search, deferredAnswers } };
+}
+
+function wantsDeepCheck(req) {
+  const value = req.query?.check ?? new URL(req.url || "/", "http://localhost").searchParams.get("check");
+  return Boolean(value) && value !== "0";
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      deferredAnswers: Boolean(redisConfig()),
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
+    return res.status(200).json(await healthReport(wantsDeepCheck(req)));
   }
 
   if (req.method !== "POST") {
