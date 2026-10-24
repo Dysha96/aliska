@@ -66,12 +66,12 @@ function mockGemini(byModel) {
   const original = globalThis.fetch;
   globalThis.fetch = (url, { signal }) => {
     const model = url.match(/models\/([^:]+):/)[1];
-    const { status = 200, text = "", delayMs = 0 } = byModel[model] || { status: 404 };
+    const { status = 200, text = "", delayMs = 0, body } = byModel[model] || { status: 404 };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => resolve({
         ok: status === 200,
         status,
-        json: async () => ({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] })
+        json: async () => body || ({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] })
       }), delayMs);
       signal.addEventListener("abort", () => {
         clearTimeout(timer);
@@ -139,6 +139,47 @@ test("overloaded Gemini gets its own message", async () => {
     await assert.rejects(askGemini("вопрос", [], "", 1000), error => {
       assert.equal(error.message, "GEMINI_OVERLOADED");
       assert.match(errorForUser(error), /перегружена/);
+      return true;
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("spaces and quotes around the pasted key are removed", async () => {
+  const { cleanKey } = await import("../api/index.js");
+  assert.equal(cleanKey('  "AQ.abc-123"\n'), "AQ.abc-123");
+  assert.equal(cleanKey("'AQ.abc'"), "AQ.abc");
+  assert.equal(cleanKey("AIzaSyX"), "AIzaSyX");
+});
+
+test("invalid key answered with HTTP 400 is reported as a key problem", async () => {
+  const { askGemini, errorForUser } = await import("../api/index.js");
+  const invalidKey = {
+    status: 400,
+    body: { error: { code: 400, message: "API key not valid.", details: [{ reason: "API_KEY_INVALID" }] } }
+  };
+  const restore = mockGemini({ "gemini-3.5-flash-lite": invalidKey, "gemini-3.1-flash-lite": invalidKey });
+  try {
+    await assert.rejects(askGemini("вопрос", [], "", 1000), error => {
+      assert.equal(error.message, "GEMINI_KEY_REJECTED");
+      assert.match(errorForUser(error), /API-ключ/);
+      return true;
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("unexpected Gemini errors name the HTTP status", async () => {
+  const { askGemini, errorForUser } = await import("../api/index.js");
+  const restore = mockGemini({
+    "gemini-3.5-flash-lite": { status: 400, body: { error: { message: "Bad request" } } },
+    "gemini-3.1-flash-lite": { status: 400, body: { error: { message: "Bad request" } } }
+  });
+  try {
+    await assert.rejects(askGemini("вопрос", [], "", 1000), error => {
+      assert.match(errorForUser(error), /ошибка 400/);
       return true;
     });
   } finally {

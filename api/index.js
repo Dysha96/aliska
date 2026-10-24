@@ -126,6 +126,7 @@ const ERROR_PRIORITY = [
   "MISSING_GEMINI_KEY",
   "INVALID_MODEL_NAME",
   "GEMINI_KEY_REJECTED",
+  "GEMINI_MODEL_NOT_FOUND",
   "GEMINI_QUOTA",
   "GEMINI_OVERLOADED",
   "TIMEOUT",
@@ -140,8 +141,22 @@ function mostUsefulError(errors) {
   return errors[0];
 }
 
+function cleanKey(value) {
+  // Keys pasted into Vercel often come with spaces or quotes around them.
+  return String(value || "").trim().replace(/^["'«]+|["'»]+$/g, "").trim();
+}
+
+function geminiHttpError(status, data) {
+  const reason = JSON.stringify(data?.error?.details || "");
+  if (status === 401 || status === 403 || reason.includes("API_KEY_INVALID")) return new Error("GEMINI_KEY_REJECTED");
+  if (status === 429) return new Error("GEMINI_QUOTA");
+  if (status === 500 || status === 503) return new Error("GEMINI_OVERLOADED");
+  if (status === 404) return new Error("GEMINI_MODEL_NOT_FOUND");
+  return Object.assign(new Error("GEMINI_REQUEST_FAILED"), { status });
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
+  const key = cleanKey(process.env.GEMINI_API_KEY);
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
@@ -194,11 +209,8 @@ async function askGeminiModel(model, key, text, history, searchContext, timeoutM
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error(`Gemini ${model} request failed with HTTP`, status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    if (status === 500 || status === 503) throw new Error("GEMINI_OVERLOADED");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error(`Gemini ${model} request failed with HTTP`, status, String(data?.error?.message || "").slice(0, 300));
+    throw geminiHttpError(status, data);
   }
 
   const candidate = data?.candidates?.[0];
@@ -230,12 +242,15 @@ function errorForUser(error) {
     case "GEMINI_OVERLOADED":
       return "Нейросеть сейчас перегружена. Попробуйте ещё раз через минуту.";
     case "INVALID_MODEL_NAME":
-      return "В настройках Vercel указано неправильное имя модели Gemini.";
+    case "GEMINI_MODEL_NOT_FOUND":
+      return "Модель Gemini не найдена. Проверьте переменную GEMINI_MODEL в настройках Vercel или удалите её.";
     case "TIME_BUDGET_EXHAUSTED":
     case "TIMEOUT":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+    case "GEMINI_EMPTY_RESPONSE":
+      return "Нейросеть вернула пустой ответ. Попробуйте спросить иначе.";
     default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+      return `Не получилось получить ответ от нейросети (${error?.status ? "ошибка " + error.status : "нет связи"}). Попробуйте ещё раз чуть позже.`;
   }
 }
 
@@ -289,9 +304,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    console.warn("Alice webhook returned a fallback response:", error?.message || "unknown error");
+    console.warn("Alice webhook returned a fallback response:", error?.message || "unknown error", error?.status || "");
     return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }
 
-export { aliceResponse, askGemini, errorForUser, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isSearchIntent, safeHistory };
