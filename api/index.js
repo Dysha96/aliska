@@ -16,14 +16,34 @@ const PENDING_TTL_SECONDS = 300;
 const DEFER_TEXT = "Секунду, ещё думаю. Скажите «ну что», и я отвечу.";
 const STILL_THINKING_TEXT = "Всё ещё думаю. Скажите «ну что» ещё раз через пару секунд.";
 
+const DEFAULT_TIMEZONE = "Europe/Moscow";
+
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Ты работаешь на нейросети Gemini от Google, а не на модели Яндекса; если спрашивают, кто ты или какая ты модель, так и отвечай.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Ответ будет произнесён вслух: не называй ссылки и адреса сайтов, не используй эмодзи.",
+  "Если переданы данные о погоде или результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
+
+function validTimezone(value) {
+  try {
+    new Intl.DateTimeFormat("ru-RU", { timeZone: value });
+    return value;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+}
+
+// Gemini does not know today's date, so "сегодня", "завтра" and "сколько дней до…" need it in the prompt.
+function systemPrompt(timezone = DEFAULT_TIMEZONE, now = new Date()) {
+  const timeZone = validTimezone(timezone);
+  const date = new Intl.DateTimeFormat("ru-RU", { timeZone, weekday: "long", day: "numeric", month: "long", year: "numeric" }).format(now);
+  const time = new Intl.DateTimeFormat("ru-RU", { timeZone, hour: "2-digit", minute: "2-digit" }).format(now);
+  return `${SYSTEM_PROMPT} Сегодня ${date}, местное время ${time} (${timeZone}).`;
+}
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -94,8 +114,8 @@ function formatSearchItems(items, shortAnswer) {
   const lines = items.slice(0, 3).map((item, i) => {
     const title = String(item.title || "").slice(0, 180);
     const snippet = String(item.snippet || "").slice(0, 350);
-    const link = String(item.link || "").slice(0, 240);
-    return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+    // Links are left out: they cost tokens and the model might read them aloud.
+    return `${i + 1}. ${title}: ${snippet}`.trim();
   });
   if (shortAnswer) lines.unshift(`Краткий ответ поисковика: ${String(shortAnswer).slice(0, 350)}`);
   return lines.join("\n");
@@ -118,8 +138,7 @@ async function searchSerper(query, timeoutMs) {
 
   const items = (Array.isArray(data.organic) ? data.organic : []).map(item => ({
     title: item.title,
-    snippet: item.snippet,
-    link: item.link
+    snippet: item.snippet
   }));
   return formatSearchItems(items, data.answerBox?.answer || data.answerBox?.snippet);
 }
@@ -142,8 +161,7 @@ async function searchTavily(query, timeoutMs) {
 
   const items = (Array.isArray(data.results) ? data.results : []).map(item => ({
     title: item.title,
-    snippet: item.content,
-    link: item.url
+    snippet: item.content
   }));
   return formatSearchItems(items, data.answer);
 }
@@ -159,6 +177,130 @@ async function searchWeb(query, timeoutMs) {
     return context;
   } catch (error) {
     console.warn(`Search via ${provider} failed; continuing without search:`, error?.status || error?.message);
+    return "";
+  }
+}
+
+// Weather comes straight from Open-Meteo: free, no key, and much faster and more precise than a web search.
+const DEFAULT_WEATHER_CITY = "Москва";
+const WEATHER_TIMEOUT_MS = 1500;
+const PATIENT_WEATHER_TIMEOUT_MS = 4000;
+const WEATHER_CODES = {
+  0: "ясно", 1: "в основном ясно", 2: "переменная облачность", 3: "пасмурно",
+  45: "туман", 48: "туман с изморозью",
+  51: "слабая морось", 53: "морось", 55: "сильная морось", 56: "ледяная морось", 57: "сильная ледяная морось",
+  61: "небольшой дождь", 63: "дождь", 65: "сильный дождь", 66: "ледяной дождь", 67: "сильный ледяной дождь",
+  71: "небольшой снег", 73: "снег", 75: "сильный снег", 77: "снежная крупа",
+  80: "небольшой ливень", 81: "ливень", 82: "сильный ливень", 85: "снегопад", 86: "сильный снегопад",
+  95: "гроза", 96: "гроза с градом", 99: "сильная гроза с градом"
+};
+// Words after "в" that are about time, not a place: "в субботу", "в выходные", "в 5 вечера".
+const NOT_A_PLACE = /^(понедельник|вторник|сред[уа]|четверг|пятниц[уа]|суббот[уа]|воскресень[ея]|выходн|будни|течени|час|минут|секунд|этот|этом|эту|эти|ближайш|следующ|прошл|начал|конц|середин|утром|обед|полдень|полночь|\d)/;
+const geocodeCache = new Map();
+
+function isWeatherIntent(text) {
+  return /погод|прогноз|осадк|зонт|на улице|дожд|снегопад|гроз[аыу]|градус|\bweather\b/i.test(text);
+}
+
+// Alice sends the place in the prepositional case ("в москве"), the geocoder expects "москва".
+function wordForms(word) {
+  const forms = [word];
+  if (/е$/.test(word)) forms.push(word.slice(0, -1) + "а", word.slice(0, -1));
+  if (/и$/.test(word)) forms.push(word.slice(0, -1) + "ь", word.slice(0, -1) + "а", word.slice(0, -1) + "я");
+  if (/[ео]м$/.test(word)) forms.push(word.slice(0, -2) + "ий", word.slice(0, -2) + "ый");
+  if (/ой$/.test(word)) forms.push(word.slice(0, -2) + "ая");
+  // "ростове-на-дону": the ending is on the first part.
+  const [head, ...rest] = word.split("-");
+  if (rest.length > 1) forms.push(...wordForms(head).slice(1).map(form => [form, ...rest].join("-")));
+  return forms;
+}
+
+const TIME_WORD = /^(сегодня|завтра|послезавтра|сейчас|вечером|утром|днём|днем|ночью)$/;
+
+function cityCandidates(text) {
+  const words = text.toLowerCase().split(/[^\p{L}\d-]+/u).filter(Boolean);
+  const at = words.findIndex((word, i) => (word === "в" || word === "во") && words[i + 1] && !NOT_A_PLACE.test(words[i + 1]));
+  if (at < 0) return [];
+  const [first, second] = [words[at + 1], words[at + 2]];
+  const candidates = [];
+  if (second && !NOT_A_PLACE.test(second) && !TIME_WORD.test(second) && second !== "в" && second !== "во") {
+    for (const a of wordForms(first).slice(0, 3)) {
+      for (const b of wordForms(second).slice(0, 3)) candidates.push(`${a} ${b}`);
+    }
+  }
+  candidates.push(...wordForms(first));
+  return [...new Set(candidates)].slice(0, 10);
+}
+
+async function geocode(candidates, timeoutMs) {
+  const cacheKey = candidates.join("|");
+  if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
+
+  const lookups = await Promise.all(candidates.map(async name => {
+    const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=5&language=ru&format=json`;
+    const { response, data } = await fetchJson(url, {}, timeoutMs).catch(() => ({ response: { ok: false } }));
+    return response.ok && Array.isArray(data.results) ? data.results.map(place => ({ ...place, query: name })) : [];
+  }));
+  const places = lookups.flat();
+  // The geocoder matches loosely, so a place whose name equals one of the word forms wins, then the biggest one.
+  const exact = places.filter(place => candidates.includes(String(place.name).toLowerCase()));
+  const best = (exact.length ? exact : places).sort((a, b) => (b.population || 0) - (a.population || 0))[0] || null;
+  if (best) geocodeCache.set(cacheKey, best);
+  return best;
+}
+
+function signedDegrees(value) {
+  const rounded = Math.round(Number(value));
+  return `${rounded > 0 ? "+" : ""}${rounded} °C`;
+}
+
+function weatherSummary(place, data) {
+  const current = data.current || {};
+  const daily = data.daily || {};
+  const label = ["Сегодня", "Завтра", "Послезавтра"];
+  const days = (daily.time || []).slice(0, 3).map((day, i) => {
+    const date = new Intl.DateTimeFormat("ru-RU", { timeZone: "UTC", weekday: "long", day: "numeric", month: "long" })
+      .format(new Date(`${day}T12:00:00Z`));
+    return `${label[i]} (${date}): от ${signedDegrees(daily.temperature_2m_min[i])} до ${signedDegrees(daily.temperature_2m_max[i])}, ` +
+      `${WEATHER_CODES[daily.weather_code[i]] || "без уточнения"}, осадки ${daily.precipitation_sum[i]} мм, ` +
+      `вероятность осадков ${daily.precipitation_probability_max[i] ?? "неизвестна"}%.`;
+  });
+  const where = [place.name, place.admin1, place.country].filter(Boolean).join(", ");
+  return [
+    `Данные о погоде (Open-Meteo) для: ${where}.`,
+    `Сейчас: ${signedDegrees(current.temperature_2m)}, ощущается как ${signedDegrees(current.apparent_temperature)}, ` +
+      `${WEATHER_CODES[current.weather_code] || "без уточнения"}, ветер ${Math.round(current.wind_speed_10m)} м/с, влажность ${current.relative_humidity_2m}%.`,
+    ...days
+  ].join("\n");
+}
+
+async function weatherContext(text, timeoutMs) {
+  const startedAt = Date.now();
+  const remainingMs = () => timeoutMs - (Date.now() - startedAt);
+  try {
+    const candidates = cityCandidates(text);
+    const defaultCity = String(process.env.WEATHER_CITY || DEFAULT_WEATHER_CITY).trim().toLowerCase();
+    const place = await geocode(candidates.length ? candidates : [defaultCity], Math.min(1000, remainingMs()));
+    if (!place) {
+      console.warn("Weather: place not found for", candidates.join(", ") || defaultCity);
+      return "";
+    }
+
+    const params = new URLSearchParams({
+      latitude: place.latitude,
+      longitude: place.longitude,
+      current: "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m",
+      daily: "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max",
+      timezone: "auto",
+      forecast_days: "3",
+      wind_speed_unit: "ms"
+    });
+    const { response, data } = await fetchJson(`https://api.open-meteo.com/v1/forecast?${params}`, {}, Math.max(100, remainingMs()));
+    if (!response.ok) throw Object.assign(new Error("WEATHER_FAILED"), { status: response.status });
+    console.log(`Weather for ${place.name} in ${Date.now() - startedAt} ms`);
+    return weatherSummary(place, data);
+  } catch (error) {
+    console.warn("Weather request failed; falling back to search:", error?.status || error?.message);
     return "";
   }
 }
@@ -205,7 +347,7 @@ function geminiHttpError(status, data) {
   return Object.assign(new Error("GEMINI_REQUEST_FAILED"), { status });
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, context, timeoutMs, timezone = DEFAULT_TIMEZONE) {
   const key = cleanKey(process.env.GEMINI_API_KEY);
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   // Non-Latin characters (e.g. a Cyrillic "А") make fetch fail before the request is even sent.
@@ -214,9 +356,10 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   // Gemini latency varies a lot under load, so the models race and the slower request is cancelled.
   const race = new AbortController();
+  const instruction = systemPrompt(timezone);
   try {
     return await Promise.any(geminiModels().map(model =>
-      askGeminiModel(model, key, text, history, searchContext, timeoutMs, race.signal)
+      askGeminiModel(model, key, text, history, context, instruction, timeoutMs, race.signal)
     ));
   } catch (error) {
     throw mostUsefulError(error?.errors || [error]);
@@ -225,7 +368,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
 }
 
-async function askGeminiModel(model, key, text, history, searchContext, timeoutMs, signal) {
+async function askGeminiModel(model, key, text, history, context, instruction, timeoutMs, signal) {
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
@@ -233,9 +376,7 @@ async function askGeminiModel(model, key, text, history, searchContext, timeoutM
     parts: [{ text: item.text }]
   }));
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
+  const prompt = context ? `${text}\n\n${context}` : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
@@ -247,7 +388,7 @@ async function askGeminiModel(model, key, text, history, searchContext, timeoutM
         "x-goog-api-key": key
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        systemInstruction: { parts: [{ text: instruction }] },
         contents,
         generationConfig: {
           temperature: 0.5,
@@ -310,19 +451,25 @@ function errorForUser(error) {
   }
 }
 
-async function answerQuestion(text, history, budgetMs) {
+async function answerQuestion(text, history, budgetMs, timezone = DEFAULT_TIMEZONE) {
   const startedAt = Date.now();
   const remainingMs = () => budgetMs - (Date.now() - startedAt);
+  // Lookups get only what is left after reserving time for Gemini, and no more than their cap.
+  const patient = budgetMs > TOTAL_RESPONSE_BUDGET_MS;
 
-  let searchContext = "";
-  const provider = searchProvider();
-  if (isSearchIntent(text) && provider) {
-    // Search gets only what is left after reserving time for Gemini, and no more than its cap.
-    const patient = budgetMs > TOTAL_RESPONSE_BUDGET_MS;
-    const cap = patient ? PATIENT_SEARCH_TIMEOUT_MS : SEARCH_TIMEOUT_MS[provider];
-    searchContext = await searchWeb(text, Math.min(cap, Math.max(0, remainingMs() - 2600)));
+  let context = "";
+  if (isWeatherIntent(text)) {
+    const cap = patient ? PATIENT_WEATHER_TIMEOUT_MS : WEATHER_TIMEOUT_MS;
+    context = await weatherContext(text, Math.min(cap, Math.max(0, remainingMs() - 2400)));
   }
-  return askGemini(text, history, searchContext, Math.max(0, remainingMs()));
+
+  const provider = searchProvider();
+  if (!context && isSearchIntent(text) && provider) {
+    const cap = patient ? PATIENT_SEARCH_TIMEOUT_MS : SEARCH_TIMEOUT_MS[provider];
+    const results = await searchWeb(text, Math.min(cap, Math.max(0, remainingMs() - 2600)));
+    if (results) context = `Результаты поиска в интернете:\n${results}\nИспользуй их только там, где они относятся к вопросу.`;
+  }
+  return askGemini(text, history, context, Math.max(0, remainingMs()), timezone);
 }
 
 function withAnswer(history, question, answer) {
@@ -422,11 +569,11 @@ async function replyToFollowUp(store, pending, history, inlineLeft) {
   return aliceResponse(STILL_THINKING_TEXT, false, history);
 }
 
-async function replyWithStore(store, text, history, inlineLeft) {
+async function replyWithStore(store, text, history, inlineLeft, timezone) {
   const pending = await store.get().catch(() => null);
   if (pending && isFollowUp(text)) return replyToFollowUp(store, pending, history, inlineLeft);
 
-  const work = answerQuestion(text, history, BACKGROUND_BUDGET_MS);
+  const work = answerQuestion(text, history, BACKGROUND_BUDGET_MS, timezone);
   const quick = await settleWithin(work, inlineLeft());
   if (quick?.error) throw quick.error;
   if (quick) {
@@ -543,6 +690,7 @@ function healthConfig() {
     gemini: cleanKey(process.env.GEMINI_API_KEY) ? "ключ задан" : "ключ не задан",
     geminiModels: geminiModels(),
     search: searchProvider() || "выключен",
+    weather: `Open-Meteo, город по умолчанию: ${String(process.env.WEATHER_CITY || DEFAULT_WEATHER_CITY).trim()}`,
     deferredAnswers: Boolean(redisConfig())
   };
 }
@@ -581,6 +729,7 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+  const timezone = validTimezone(body?.meta?.timezone || DEFAULT_TIMEZONE);
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -593,10 +742,10 @@ export default async function handler(req, res) {
   try {
     const store = pendingStore(body?.session?.session_id);
     if (store) {
-      return res.status(200).json(await replyWithStore(store, text, oldHistory, () => INLINE_WAIT_MS - elapsedMs()));
+      return res.status(200).json(await replyWithStore(store, text, oldHistory, () => INLINE_WAIT_MS - elapsedMs(), timezone));
     }
 
-    const answer = await answerQuestion(text, oldHistory, TOTAL_RESPONSE_BUDGET_MS - elapsedMs());
+    const answer = await answerQuestion(text, oldHistory, TOTAL_RESPONSE_BUDGET_MS - elapsedMs(), timezone);
     return res.status(200).json(aliceResponse(answer, false, withAnswer(oldHistory, text, answer)));
   } catch (error) {
     logFallback(error);
@@ -604,4 +753,18 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isFollowUp, isSearchIntent, safeHistory, searchWeb };
+export {
+  aliceResponse,
+  askGemini,
+  cityCandidates,
+  cleanKey,
+  errorForUser,
+  fitAliceText,
+  isFollowUp,
+  isSearchIntent,
+  isWeatherIntent,
+  safeHistory,
+  searchWeb,
+  systemPrompt,
+  weatherContext
+};

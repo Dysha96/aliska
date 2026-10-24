@@ -239,7 +239,7 @@ test("Tavily is used when its key is set, even if Serper is configured too", asy
     assert.equal(mock.calls[0].headers.Authorization, "Bearer tvly-test");
     assert.equal(mock.calls[0].body.query, "курс доллара сегодня");
     assert.equal(mock.calls[0].body.max_results, 3);
-    assert.equal(context, "1. ЦБ РФ: Курс доллара 95 рублей https://cbr.ru");
+    assert.equal(context, "1. ЦБ РФ: Курс доллара 95 рублей");
   } finally {
     mock.restore();
   }
@@ -255,7 +255,7 @@ test("Serper still works when only its key is set", async () => {
   try {
     const context = await searchWeb("курс доллара", 1000);
     assert.equal(mock.calls[0].url, "https://google.serper.dev/search");
-    assert.equal(context, "Краткий ответ поисковика: 95 рублей\n1. Курс: Доллар https://example.ru");
+    assert.equal(context, "Краткий ответ поисковика: 95 рублей\n1. Курс: Доллар");
   } finally {
     mock.restore();
   }
@@ -403,6 +403,7 @@ test("plain health check lists the configuration without calling anything", asyn
       gemini: "ключ задан",
       geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
       search: "tavily",
+      weather: "Open-Meteo, город по умолчанию: Москва",
       deferredAnswers: false
     });
     assert.equal(report.checks, undefined);
@@ -474,9 +475,9 @@ function mockSlowTavily(tavilyDelayMs) {
     if (url === "https://redis.test") return reply({ result: null });
     if (url === "https://api.tavily.com/search") {
       tavilyBodies.push(JSON.parse(body));
-      return reply({ answer: "В Москве +5, облачно", results: [] }, tavilyDelayMs);
+      return reply({ answer: "Курс доллара 95 рублей", results: [] }, tavilyDelayMs);
     }
-    const usedSearch = body.includes("В Москве +5");
+    const usedSearch = body.includes("Курс доллара 95 рублей");
     return reply({ candidates: [{ content: { parts: [{ text: usedSearch ? "С поиском" : "Без поиска" }] } }] }, 50);
   };
   process.env.GEMINI_API_KEY = "test-key";
@@ -495,7 +496,7 @@ test("with the store configured, a slow search is waited for and asked for a sho
   process.env.KV_REST_API_URL = "https://redis.test";
   process.env.KV_REST_API_TOKEN = "redis-token";
   try {
-    assert.equal(await say("Какая погода сегодня в Москве?"), "С поиском");
+    assert.equal(await say("Какой курс доллара сегодня?"), "С поиском");
     assert.equal(mock.tavilyBodies[0].include_answer, true);
   } finally {
     mock.restore();
@@ -505,8 +506,112 @@ test("with the store configured, a slow search is waited for and asked for a sho
 test("without the store, search keeps its short limit so Alice is not kept waiting", async () => {
   const mock = mockSlowTavily(2500);
   try {
-    assert.equal(await say("Какая погода сегодня в Москве?"), "Без поиска");
+    assert.equal(await say("Какой курс доллара сегодня?"), "Без поиска");
     assert.equal(mock.tavilyBodies[0].include_answer, false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("the prompt carries the current date and local time", async () => {
+  const { systemPrompt } = await import("../api/index.js");
+  const prompt = systemPrompt("Europe/Moscow", new Date("2026-10-24T19:05:00Z"));
+  assert.match(prompt, /суббота, 24 октября 2026/);
+  assert.match(prompt, /22:05/);
+  assert.match(prompt, /не называй ссылки/);
+  assert.match(systemPrompt("Not/AZone", new Date("2026-10-24T19:05:00Z")), /Europe\/Moscow/);
+});
+
+test("weather questions are recognised", async () => {
+  const { isWeatherIntent } = await import("../api/index.js");
+  for (const phrase of ["какая погода в москве", "нужен ли завтра зонт", "что на улице", "прогноз на выходные", "будет ли дождь в санкт-петербурге", "сколько градусов в казани"]) {
+    assert.equal(isWeatherIntent(phrase), true, phrase);
+  }
+  assert.equal(isWeatherIntent("почему небо голубое"), false);
+});
+
+test("the city is taken from the phrase and put back into its basic form", async () => {
+  const { cityCandidates } = await import("../api/index.js");
+  assert.ok(cityCandidates("какая погода в москве").includes("москва"));
+  assert.ok(cityCandidates("погода в санкт-петербурге завтра").includes("санкт-петербург"));
+  assert.ok(cityCandidates("погода в казани").includes("казань"));
+  assert.ok(cityCandidates("погода в нижнем новгороде").includes("нижний новгород"));
+  assert.deepEqual(cityCandidates("какая погода будет в субботу"), []);
+  assert.ok(cityCandidates("погода во вторник в москве").includes("москва"));
+  assert.ok(cityCandidates("какая погода в 5 вечера в сочи").includes("сочи"));
+  assert.ok(cityCandidates("погода в ростове-на-дону").includes("ростов-на-дону"));
+  assert.deepEqual(cityCandidates("погода на завтра"), []);
+});
+
+function mockOpenMeteo() {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push(url);
+    const reply = body => ({ ok: true, status: 200, json: async () => body });
+    if (url.startsWith("https://geocoding-api.open-meteo.com/")) {
+      const name = new URL(url).searchParams.get("name");
+      if (name === "казань") return reply({ results: [{ name: "Казань", admin1: "Татарстан", country: "Россия", latitude: 55.79, longitude: 49.12, population: 1250000 }] });
+      if (name === "москва") return reply({ results: [{ name: "Москва", country: "Россия", latitude: 55.75, longitude: 37.62, population: 12000000 }] });
+      // Loose matching of other forms returns a small unrelated village.
+      return reply({ results: [{ name: "Казанка", country: "Россия", latitude: 1, longitude: 1, population: 300 }] });
+    }
+    if (url.startsWith("https://api.open-meteo.com/")) {
+      return reply({
+        current: { temperature_2m: 4.6, apparent_temperature: 1.2, weather_code: 3, wind_speed_10m: 4.4, relative_humidity_2m: 81 },
+        daily: {
+          time: ["2026-10-24", "2026-10-25", "2026-10-26"],
+          weather_code: [61, 0, 71],
+          temperature_2m_max: [6.2, 8, -0.4],
+          temperature_2m_min: [1.8, 2.1, -3.6],
+          precipitation_sum: [1.2, 0, 2.5],
+          precipitation_probability_max: [60, 5, 80]
+        }
+      });
+    }
+    const usedWeather = String(options.body).includes("Данные о погоде");
+    return reply({ candidates: [{ content: { parts: [{ text: usedWeather ? "По данным о погоде" : "Без данных" }] } }] });
+  };
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = original;
+      for (const name of ["GEMINI_API_KEY", "TAVILY_API_KEY", "WEATHER_CITY"]) delete process.env[name];
+    }
+  };
+}
+
+test("weather is fetched from Open-Meteo for the named city", async () => {
+  const { weatherContext } = await import("../api/index.js");
+  const mock = mockOpenMeteo();
+  try {
+    const context = await weatherContext("какая погода в казани", 2000);
+    assert.match(context, /для: Казань, Татарстан, Россия/);
+    assert.match(context, /Сейчас: \+5 °C, ощущается как \+1 °C, пасмурно, ветер 4 м\/с/);
+    assert.match(context, /Сегодня \(суббота, 24 октября\): от \+2 °C до \+6 °C, небольшой дождь/);
+    assert.match(context, /Послезавтра \(понедельник, 26 октября\): от -4 °C до 0 °C, небольшой снег/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("without a city in the phrase the default city is used", async () => {
+  const { weatherContext } = await import("../api/index.js");
+  const mock = mockOpenMeteo();
+  try {
+    assert.match(await weatherContext("нужен ли завтра зонт", 2000), /для: Москва, Россия/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a weather question goes to Open-Meteo instead of the web search", async () => {
+  const mock = mockOpenMeteo();
+  process.env.GEMINI_API_KEY = "test-key";
+  process.env.TAVILY_API_KEY = "tvly-test";
+  try {
+    assert.equal(await say("Какая погода сегодня в Москве?"), "По данным о погоде");
+    assert.equal(mock.calls.some(url => url.includes("tavily")), false);
   } finally {
     mock.restore();
   }
