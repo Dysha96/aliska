@@ -207,3 +207,78 @@ test("a key with Cyrillic letters gets a clear message instead of a network erro
     restore();
   }
 });
+
+function mockSearch(reply) {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, headers: options.headers, body: JSON.parse(options.body) });
+    return { ok: reply.status === 200, status: reply.status, json: async () => reply.body };
+  };
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = original;
+      delete process.env.TAVILY_API_KEY;
+      delete process.env.SERPER_API_KEY;
+    }
+  };
+}
+
+test("Tavily is used when its key is set, even if Serper is configured too", async () => {
+  const { searchWeb } = await import("../api/index.js");
+  const mock = mockSearch({
+    status: 200,
+    body: { results: [{ title: "ЦБ РФ", content: "Курс доллара 95 рублей", url: "https://cbr.ru" }] }
+  });
+  process.env.TAVILY_API_KEY = " tvly-test ";
+  process.env.SERPER_API_KEY = "serper-test";
+  try {
+    const context = await searchWeb("курс доллара сегодня", 1000);
+    assert.equal(mock.calls[0].url, "https://api.tavily.com/search");
+    assert.equal(mock.calls[0].headers.Authorization, "Bearer tvly-test");
+    assert.equal(mock.calls[0].body.query, "курс доллара сегодня");
+    assert.equal(mock.calls[0].body.max_results, 3);
+    assert.equal(context, "1. ЦБ РФ: Курс доллара 95 рублей https://cbr.ru");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Serper still works when only its key is set", async () => {
+  const { searchWeb } = await import("../api/index.js");
+  const mock = mockSearch({
+    status: 200,
+    body: { answerBox: { answer: "95 рублей" }, organic: [{ title: "Курс", snippet: "Доллар", link: "https://example.ru" }] }
+  });
+  process.env.SERPER_API_KEY = "serper-test";
+  try {
+    const context = await searchWeb("курс доллара", 1000);
+    assert.equal(mock.calls[0].url, "https://google.serper.dev/search");
+    assert.equal(context, "Краткий ответ поисковика: 95 рублей\n1. Курс: Доллар https://example.ru");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a failed search does not break the answer", async () => {
+  const { searchWeb } = await import("../api/index.js");
+  const mock = mockSearch({ status: 432, body: { detail: { error: "Usage limit exceeded" } } });
+  process.env.TAVILY_API_KEY = "tvly-test";
+  try {
+    assert.equal(await searchWeb("новости сегодня", 1000), "");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("no search key means no search request", async () => {
+  const { searchWeb } = await import("../api/index.js");
+  const mock = mockSearch({ status: 200, body: {} });
+  try {
+    assert.equal(await searchWeb("погода сегодня", 1000), "");
+    assert.equal(mock.calls.length, 0);
+  } finally {
+    mock.restore();
+  }
+});

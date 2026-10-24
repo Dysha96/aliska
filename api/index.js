@@ -6,6 +6,8 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 600;
+// Tavily is usually slower than Serper, so it gets a bit more of the 4.5 s Alice budget.
+const TAVILY_TIMEOUT_MS = 1200;
 const GEMINI_TIMEOUT_MS = 3400;
 
 const SYSTEM_PROMPT = [
@@ -75,43 +77,77 @@ async function fetchJson(url, options, timeoutMs, outerSignal) {
   }
 }
 
+function searchProvider() {
+  if (cleanKey(process.env.TAVILY_API_KEY)) return "tavily";
+  if (cleanKey(process.env.SERPER_API_KEY)) return "serper";
+  return "";
+}
+
+function formatSearchItems(items, shortAnswer) {
+  const lines = items.slice(0, 3).map((item, i) => {
+    const title = String(item.title || "").slice(0, 180);
+    const snippet = String(item.snippet || "").slice(0, 350);
+    const link = String(item.link || "").slice(0, 240);
+    return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+  });
+  if (shortAnswer) lines.unshift(`Краткий ответ поисковика: ${String(shortAnswer).slice(0, 350)}`);
+  return lines.join("\n");
+}
+
+async function searchSerper(query, timeoutMs) {
+  const { response, data } = await fetchJson(
+    "https://google.serper.dev/search",
+    {
+      method: "POST",
+      headers: {
+        "X-API-KEY": cleanKey(process.env.SERPER_API_KEY),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+    },
+    Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+  );
+  if (!response.ok) throw Object.assign(new Error("SEARCH_FAILED"), { status: response.status });
+
+  const items = (Array.isArray(data.organic) ? data.organic : []).map(item => ({
+    title: item.title,
+    snippet: item.snippet,
+    link: item.link
+  }));
+  return formatSearchItems(items, data.answerBox?.answer || data.answerBox?.snippet);
+}
+
+async function searchTavily(query, timeoutMs) {
+  const { response, data } = await fetchJson(
+    "https://api.tavily.com/search",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${cleanKey(process.env.TAVILY_API_KEY)}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ query, search_depth: "basic", max_results: 3, include_answer: false })
+    },
+    Math.min(TAVILY_TIMEOUT_MS, timeoutMs)
+  );
+  if (!response.ok) throw Object.assign(new Error("SEARCH_FAILED"), { status: response.status });
+
+  const items = (Array.isArray(data.results) ? data.results : []).map(item => ({
+    title: item.title,
+    snippet: item.content,
+    link: item.url
+  }));
+  return formatSearchItems(items, data.answer);
+}
+
 async function searchWeb(query, timeoutMs) {
-  const key = cleanKey(process.env.SERPER_API_KEY);
-  if (!key || timeoutMs < 150) return "";
+  const provider = searchProvider();
+  if (!provider || timeoutMs < 150) return "";
 
   try {
-    const { response, data } = await fetchJson(
-      "https://google.serper.dev/search",
-      {
-        method: "POST",
-        headers: {
-          "X-API-KEY": key,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
-      },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
-    );
-
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
-
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
+    return provider === "tavily" ? await searchTavily(query, timeoutMs) : await searchSerper(query, timeoutMs);
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn(`Search via ${provider} failed; continuing without search:`, error?.status || error?.message);
     return "";
   }
 }
@@ -291,9 +327,9 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (isSearchIntent(text) && searchProvider()) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.max(0, remainingMs() - 2600));
     }
 
     const answer = await askGemini(
@@ -320,4 +356,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, askGemini, cleanKey, errorForUser, fitAliceText, isSearchIntent, safeHistory, searchWeb };
