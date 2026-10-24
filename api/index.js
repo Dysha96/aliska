@@ -182,7 +182,7 @@ async function searchWeb(query, timeoutMs) {
 }
 
 // Weather comes straight from Open-Meteo: free, no key, and much faster and more precise than a web search.
-const DEFAULT_WEATHER_CITY = "Москва";
+const DEFAULT_WEATHER_CITY = "Новосибирск";
 const WEATHER_TIMEOUT_MS = 1500;
 const PATIENT_WEATHER_TIMEOUT_MS = 4000;
 const WEATHER_CODES = {

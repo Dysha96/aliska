@@ -403,7 +403,7 @@ test("plain health check lists the configuration without calling anything", asyn
       gemini: "ключ задан",
       geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
       search: "tavily",
-      weather: "Open-Meteo, город по умолчанию: Москва",
+      weather: "Open-Meteo, город по умолчанию: Новосибирск",
       deferredAnswers: false
     });
     assert.equal(report.checks, undefined);
@@ -553,6 +553,7 @@ function mockOpenMeteo() {
       const name = new URL(url).searchParams.get("name");
       if (name === "казань") return reply({ results: [{ name: "Казань", admin1: "Татарстан", country: "Россия", latitude: 55.79, longitude: 49.12, population: 1250000 }] });
       if (name === "москва") return reply({ results: [{ name: "Москва", country: "Россия", latitude: 55.75, longitude: 37.62, population: 12000000 }] });
+      if (name === "новосибирск") return reply({ results: [{ name: "Новосибирск", admin1: "Новосибирская область", country: "Россия", latitude: 55.04, longitude: 82.93, population: 1600000 }] });
       // Loose matching of other forms returns a small unrelated village.
       return reply({ results: [{ name: "Казанка", country: "Россия", latitude: 1, longitude: 1, population: 300 }] });
     }
@@ -599,7 +600,9 @@ test("without a city in the phrase the default city is used", async () => {
   const { weatherContext } = await import("../api/index.js");
   const mock = mockOpenMeteo();
   try {
-    assert.match(await weatherContext("нужен ли завтра зонт", 2000), /для: Москва, Россия/);
+    assert.match(await weatherContext("какая погода", 2000), /для: Новосибирск, Новосибирская область, Россия/);
+    assert.match(await weatherContext("нужен ли завтра зонт", 2000), /для: Новосибирск/);
+    assert.match(await weatherContext("какая погода в москве", 2000), /для: Москва, Россия/);
   } finally {
     mock.restore();
   }
