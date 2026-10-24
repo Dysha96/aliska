@@ -499,6 +499,21 @@ function logFallback(error) {
   console.warn("Alice webhook returned a fallback response:", code, error?.status || "");
 }
 
+function normalizePhrase(text) {
+  return String(text).toLowerCase().replace(/ё/g, "е").replace(/[^\p{L}\d\s-]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+function isRepeatRequest(text) {
+  return /^(а |ну )?(повтори(те)?|повторить|можешь повторить|скажи еще раз|еще раз|что ты сказала|что-что|что что|что|чего|не расслышала?|не услышала?|не поняла?)( пожалуйста| еще раз)?$/.test(normalizePhrase(text));
+}
+
+// The last question and answer, taken from the stored conversation.
+function lastExchange(history) {
+  const answerAt = history.findLastIndex(item => item.role === "model");
+  if (answerAt < 1 || history[answerAt - 1].role !== "user") return null;
+  return { question: history[answerAt - 1].text, answer: history[answerAt].text };
+}
+
 function isFollowUp(text) {
   return /^(?:(?:ну|и|а|так)\s*)?(?:что там|что|как|чё|че|готово|готов|дальше|давай|какой ответ|ответ|говори|скажи|продолжай)?[\s?!.]*$/i.test(text.trim());
 }
@@ -595,6 +610,12 @@ async function replyWithStore(store, text, yandexHistory, inlineLeft, timezone) 
   const pending = saved.pending || null;
   const history = saved.history ? safeHistory(saved.history) : yandexHistory;
   if (pending && isFollowUp(text)) return replyToFollowUp(store, pending, history, inlineLeft);
+
+  // "Повтори" or the same question again (usually misheard): give the last answer instantly, word for word.
+  const last = lastExchange(history);
+  if (last && (isRepeatRequest(text) || normalizePhrase(text) === normalizePhrase(last.question))) {
+    return aliceResponse(last.answer, false, history);
+  }
 
   const work = answerQuestion(text, history, BACKGROUND_BUDGET_MS, timezone);
   const quick = await settleWithin(work, inlineLeft());
@@ -789,6 +810,7 @@ export {
   errorForUser,
   fitAliceText,
   isFollowUp,
+  isRepeatRequest,
   isSearchIntent,
   isWeatherIntent,
   safeHistory,

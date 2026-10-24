@@ -686,3 +686,36 @@ test("a deferred answer joins the conversation history", async () => {
     mock.restore();
   }
 });
+
+test("repeat requests are recognised", async () => {
+  const { isRepeatRequest } = await import("../api/index.js");
+  for (const phrase of ["повтори", "Повтори, пожалуйста", "ещё раз", "что?", "не расслышал", "можешь повторить", "а что ты сказала"]) {
+    assert.equal(isRepeatRequest(phrase), true, phrase);
+  }
+  for (const phrase of ["повтори таблицу умножения", "что такое любовь", "ещё раз про погоду расскажи подробнее"]) {
+    assert.equal(isRepeatRequest(phrase), false, phrase);
+  }
+});
+
+test("«повтори» and the same question again return the last answer without asking Gemini", async () => {
+  const mock = mockGeminiAndRedis(10, "Лев Толстой.");
+  try {
+    assert.equal(await say("Кто написал «Войну и мир»?", "chat-3"), "Лев Толстой.");
+    const asked = mock.geminiBodies.length;
+    assert.equal(await say("повтори", "chat-3"), "Лев Толстой.");
+    assert.equal(await say("кто написал войну и мир", "chat-3"), "Лев Толстой.");
+    assert.equal(mock.geminiBodies.length, asked);
+    assert.equal(JSON.parse(mock.db.get("alice:history:chat-3")).length, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("«повтори» with nothing said yet goes to Gemini as usual", async () => {
+  const mock = mockGeminiAndRedis(10, "Мне пока нечего повторить.");
+  try {
+    assert.equal(await say("повтори", "chat-4"), "Мне пока нечего повторить.");
+  } finally {
+    mock.restore();
+  }
+});
