@@ -17,7 +17,7 @@ const DEFER_TEXT = "Секунду, ещё думаю. Скажите «ну ч�
 const STILL_THINKING_TEXT = "Всё ещё думаю. Скажите «ну что» ещё раз через пару секунд.";
 // Yandex recommends a sound while the user waits; it also buys Gemini a couple more seconds.
 // Sound library: https://yandex.ru/dev/dialogs/alice/doc/ru/sounds
-const WAITING_SOUND = '<speaker audio="alice-music-harp-1.opus">';
+const WAITING_SOUND = '<speaker audio="alice-music-drums-3.opus">';
 const DEFER_TTS = `Секунду, ещё думаю. ${WAITING_SOUND} Скажите «ну что», и я отвечу.`;
 const STILL_THINKING_TTS = `Всё ещё думаю. ${WAITING_SOUND} Скажите «ну что» ещё раз.`;
 
