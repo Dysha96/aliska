@@ -410,6 +410,7 @@ test("without the secret word /api reveals nothing and calls nothing", async () 
   try {
     assert.deepEqual(await health("/api"), { ok: true });
     assert.deepEqual(await health("/api?check=1"), { ok: true });
+    assert.deepEqual(await health("/api?check="), { ok: true });
     process.env.HEALTH_TOKEN = "secret-word";
     assert.deepEqual(await health("/api?check=wrong"), { ok: true });
   } finally {
@@ -719,5 +720,19 @@ test("«повтори» with nothing said yet goes to Gemini as usual", async (
     assert.equal(await say("повтори", "chat-4"), "Мне пока нечего повторить.");
   } finally {
     mock.restore();
+  }
+});
+
+test("the built-in secret word opens the health report without HEALTH_TOKEN", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+  process.env.GEMINI_API_KEY = "test-key";
+  try {
+    const report = await health("/api?check=check-L4uNVTVVVYhF");
+    assert.ok(report.checks);
+    assert.equal(report.config.gemini, "ключ задан");
+  } finally {
+    globalThis.fetch = original;
+    delete process.env.GEMINI_API_KEY;
   }
 });

@@ -750,9 +750,12 @@ async function healthReport() {
   return { ok: gemini.ok, config: healthConfig(), checks: { gemini, search, deferredAnswers } };
 }
 
-// The configuration and connection report is shown only with ?check=<HEALTH_TOKEN>; strangers just see {"ok":true}.
+// The configuration and connection report is shown only with ?check=<secret word>; strangers just see {"ok":true}.
+// The word lives here so it does not have to be set on every hosting; HEALTH_TOKEN overrides it.
+const DEFAULT_HEALTH_TOKEN = "check-L4uNVTVVVYhF";
+
 function wantsHealthReport(req) {
-  const token = cleanKey(process.env.HEALTH_TOKEN);
+  const token = cleanKey(process.env.HEALTH_TOKEN) || DEFAULT_HEALTH_TOKEN;
   const value = req.query?.check ?? new URL(req.url || "/", "http://localhost").searchParams.get("check");
   return Boolean(token) && value === token;
 }
