@@ -19,7 +19,7 @@ test("relay forwards the Alice request and returns the skill's answer", async ()
   try {
     const event = { session: { session_id: "s" }, request: { command: "привет" }, version: "1.0" };
     const result = await handler(event);
-    assert.equal(sent.url, "https://aliska.vercel.app/api");
+    assert.equal(sent.url, "https://aliska-aliska.vercel.app/api");
     assert.deepEqual(sent.body, event);
     assert.equal(result.response.text, "Ответ");
   } finally {

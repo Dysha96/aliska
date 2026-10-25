@@ -2,7 +2,7 @@
 // and it forwards the request to the skill on Vercel, which Yandex's own servers may not be able to reach.
 // Runtime: Node.js 22, entry point: index.handler. Setup steps are in README.md.
 
-const SKILL_URL = process.env.SKILL_URL || "https://aliska.vercel.app/api";
+const SKILL_URL = process.env.SKILL_URL || "https://aliska-aliska.vercel.app/api";
 // Alice waits 4.5 s in total; leave room for the hop from Yandex to this function and back.
 const TIMEOUT_MS = 4200;
 
