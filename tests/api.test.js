@@ -42,8 +42,7 @@ test("GET health check returns an ok response", async () => {
   };
   await handler({ method: "GET" }, res);
   assert.equal(statusCode, 200);
-  assert.equal(payload.ok, true);
-  assert.equal(payload.service, "alice-gemini-serper");
+  assert.deepEqual(payload, { ok: true });
 });
 
 test("launch request returns a valid Alice greeting without external API keys", async () => {
@@ -404,31 +403,23 @@ async function health(url) {
   return payload;
 }
 
-test("plain health check lists the configuration without calling anything", async () => {
+test("without the secret word /api reveals nothing and calls nothing", async () => {
   const original = globalThis.fetch;
   globalThis.fetch = () => { throw new Error("must not be called"); };
   process.env.GEMINI_API_KEY = "test-key";
-  process.env.TAVILY_API_KEY = "tvly-test";
   try {
-    const report = await health("/api");
-    assert.equal(report.ok, true);
-    assert.deepEqual(report.config, {
-      gemini: "ключ задан",
-      geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
-      search: "tavily",
-      weather: "Open-Meteo, город по умолчанию: Новосибирск",
-      deferredAnswers: false,
-      memory: false
-    });
-    assert.equal(report.checks, undefined);
+    assert.deepEqual(await health("/api"), { ok: true });
+    assert.deepEqual(await health("/api?check=1"), { ok: true });
+    process.env.HEALTH_TOKEN = "secret-word";
+    assert.deepEqual(await health("/api?check=wrong"), { ok: true });
   } finally {
     globalThis.fetch = original;
     delete process.env.GEMINI_API_KEY;
-    delete process.env.TAVILY_API_KEY;
+    delete process.env.HEALTH_TOKEN;
   }
 });
 
-test("?check=1 verifies Gemini models, search usage and the store", async () => {
+test("?check=<HEALTH_TOKEN> shows the configuration and verifies Gemini, search and the store", async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     const reply = (status, body) => ({ ok: status === 200, status, json: async () => body });
@@ -445,9 +436,18 @@ test("?check=1 verifies Gemini models, search usage and the store", async () => 
   process.env.TAVILY_API_KEY = "tvly-test";
   process.env.KV_REST_API_URL = "https://redis.test";
   process.env.KV_REST_API_TOKEN = "redis-token";
+  process.env.HEALTH_TOKEN = "secret-word";
   try {
-    const report = await health("/api?check=1");
+    const report = await health("/api?check=secret-word");
     assert.equal(report.ok, true);
+    assert.deepEqual(report.config, {
+      gemini: "ключ задан",
+      geminiModels: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+      search: "tavily",
+      weather: "Open-Meteo, город по умолчанию: Новосибирск",
+      deferredAnswers: true,
+      memory: true
+    });
     assert.deepEqual(report.checks, {
       gemini: { ok: true, models: { "gemini-3.5-flash-lite": "ok", "gemini-3.1-flash-lite": "модель не найдена" } },
       search: { provider: "tavily", ok: true, status: "ok", used: 12, limit: 1000 },
@@ -455,16 +455,17 @@ test("?check=1 verifies Gemini models, search usage and the store", async () => 
     });
   } finally {
     globalThis.fetch = original;
-    for (const name of ["GEMINI_API_KEY", "TAVILY_API_KEY", "KV_REST_API_URL", "KV_REST_API_TOKEN"]) delete process.env[name];
+    for (const name of ["GEMINI_API_KEY", "TAVILY_API_KEY", "KV_REST_API_URL", "KV_REST_API_TOKEN", "HEALTH_TOKEN"]) delete process.env[name];
   }
 });
 
-test("?check=1 reports a rejected Gemini key as not ok", async () => {
+test("the health report marks a rejected Gemini key as not ok", async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: { details: [{ reason: "API_KEY_INVALID" }] } }) });
   process.env.GEMINI_API_KEY = "AQ.wrong";
+  process.env.HEALTH_TOKEN = "secret-word";
   try {
-    const report = await health("/api?check=1");
+    const report = await health("/api?check=secret-word");
     assert.equal(report.ok, false);
     assert.equal(report.checks.gemini.models["gemini-3.5-flash-lite"], "ключ не принят");
     assert.equal(report.checks.search.ok, false);
@@ -472,6 +473,7 @@ test("?check=1 reports a rejected Gemini key as not ok", async () => {
   } finally {
     globalThis.fetch = original;
     delete process.env.GEMINI_API_KEY;
+    delete process.env.HEALTH_TOKEN;
   }
 });
 

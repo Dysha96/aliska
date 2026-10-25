@@ -744,28 +744,22 @@ function healthConfig() {
   };
 }
 
-async function healthReport(deep) {
-  const report = {
-    ok: true,
-    service: "alice-gemini-serper",
-    message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
-    config: healthConfig()
-  };
-  if (!deep) return { ...report, hint: "Откройте /api?check=1, чтобы проверить ключи и подключения." };
-
+async function healthReport() {
   const [gemini, search, deferredAnswers] = await Promise.all([checkGemini(), checkSearch(), checkStore()]);
   // Search and the store are optional: only Gemini decides whether the skill can answer at all.
-  return { ...report, ok: gemini.ok, checks: { gemini, search, deferredAnswers } };
+  return { ok: gemini.ok, config: healthConfig(), checks: { gemini, search, deferredAnswers } };
 }
 
-function wantsDeepCheck(req) {
+// The configuration and connection report is shown only with ?check=<HEALTH_TOKEN>; strangers just see {"ok":true}.
+function wantsHealthReport(req) {
+  const token = cleanKey(process.env.HEALTH_TOKEN);
   const value = req.query?.check ?? new URL(req.url || "/", "http://localhost").searchParams.get("check");
-  return Boolean(value) && value !== "0";
+  return Boolean(token) && value === token;
 }
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json(await healthReport(wantsDeepCheck(req)));
+    return res.status(200).json(wantsHealthReport(req) ? await healthReport() : { ok: true });
   }
 
   if (req.method !== "POST") {
